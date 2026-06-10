@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# space_mapping.yaml — 25Live  →  Niagara N4 schedule cross-reference
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Two sections:
+#   buildings:  each building's roll-up schedule, defined ONCE.
+#   spaces:     the rooms; each room names the building it belongs to.
+#
+# HOW THE BUILDING CALENDAR IS BUILT
+#   Every room that names a `building` is automatically unioned into that
+#   building's occupancy schedule. So if ANY room in the building is occupied,
+#   the building schedule (hallways, lobbies, common AHUs) runs HVAC too.
+#   You do NOT repeat the building's Niagara path on each room — you just give
+#   the building id. That makes "all rooms in the building" the default and
+#   removes the chance of forgetting to wire one up.
+#
+# ── buildings: fields ──
+#   id            (required)  short key that rooms reference (e.g. social_sciences)
+#   name          (optional)  label for logs
+#   niagara_path  (required)  the building roll-up schedule slot, RELATIVE to
+#                             CONFIG -> niagara -> schedule_base_path
+#                             (default slot:/Schedules)
+#   space_id      (optional)  ONLY if the building common area is itself bookable
+#                             in 25Live (e.g. an atrium); its own events then also
+#                             count toward the building schedule
+#
+# ── spaces: (room) fields ──
+#   space_id              (required)  25Live numeric space id (from the space's
+#                                     URL / detail in 25Live -> Locations)
+#   space_name            (optional)  label for logs; defaults to the id
+#   building              (optional)  id of the building this room rolls into.
+#                                     Omit for a room that should run on its own
+#                                     and NOT drive any building schedule.
+#   niagara_path          (required)  this room's own schedule slot
+#   pre_condition_minutes (optional)  HVAC lead time BEFORE events (default 30)
+#   post_buffer_minutes   (optional)  hold time AFTER events (default 15)
+#   merge_gap_minutes     (optional)  collapse this room's back-to-back windows
+#                                     that are within this many minutes
+#                                     (default 5). Merges ACROSS rooms (the
+#                                     building roll-up) use the global default;
+#                                     a room's own gap still shapes the windows
+#                                     it contributes to its building.
+#
+# To add a room: copy a block, set space_id / niagara_path / building. Done —
+# it joins its building's roll-up automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+buildings:
+
+  - id: social_sciences
+    name: "Social Sciences"
+    niagara_path: "SocialSciences/Building_Occ"
+
+  - id: eng_tech
+    name: "Engineering Technology"
+    niagara_path: "EngTech/Building_Occ"
+
+  - id: student_center
+    name: "Student Center"
+    niagara_path: "StudentCenter/Building_Occ"
+    space_id: 9001            # the atrium is itself bookable in 25Live
+
+
+spaces:
+
+  # Two rooms in Social Sciences — BOTH automatically feed SocialSciences/Building_Occ.
+  # Either one being booked turns on the building (hallway/lobby) HVAC.
+  - space_id: 1234
+    space_name: "Social Sciences 1021"
+    building: social_sciences
+    niagara_path: "SocialSciences/Rm1021_Occ"
+    pre_condition_minutes: 45        # large lecture hall — longer warm-up
+    post_buffer_minutes: 15
+
+  - space_id: 1235
+    space_name: "Social Sciences 1022"
+    building: social_sciences
+    niagara_path: "SocialSciences/Rm1022_Occ"
+
+  # A lab in Engineering Tech — rolls into EngTech/Building_Occ.
+  - space_id: 2050
+    space_name: "Engineering Tech 110 Lab"
+    building: eng_tech
+    niagara_path: "EngTech/Rm110_Occ"
+    pre_condition_minutes: 60        # fume-hood lab — long pre-conditioning
+    merge_gap_minutes: 30            # keep HVAC on between closely-spaced labs
+
+  # A room that should run on its own only (no building roll-up): omit `building`.
+  # - space_id: 3000
+  #   space_name: "Standalone Annex"
+  #   niagara_path: "Annex/Rm1_Occ"
