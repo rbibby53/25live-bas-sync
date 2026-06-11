@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import quote
 
 import requests
 import yaml
@@ -72,6 +73,10 @@ NIAGARA_REST_BASE = "/rest/v1"
 
 # 25Live pagination: events returned per API page.
 PAGE_SIZE = 100
+
+# Safety cap on how many pages we'll pull per batch, in case an API that ignores
+# paging would otherwise loop forever. 1000 pages * PAGE_SIZE = 100k events.
+MAX_PAGES = 1000
 
 # 25Live: how many space IDs to request per call. Keeps the query string under
 # typical URL-length limits when the space map is large.
@@ -235,6 +240,16 @@ class SpaceConfig:
 # Space map loader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _int_or_default(value, default: int) -> int:
+    """
+    Return the configured value, falling back to `default` only when it is truly
+    absent (None). A plain `value or default` would wrongly replace an explicit
+    0 — e.g. a room that intentionally sets pre_condition_minutes: 0 to disable
+    pre-conditioning would silently get the 30-minute default instead.
+    """
+    return default if value is None else int(value)
+
+
 def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
     """
     Parse space_mapping.yaml into { space_id: SpaceConfig }.
@@ -287,9 +302,9 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
             space_type="room",
             niagara_path=row["niagara_path"],
             building_schedule_path=building_path,
-            pre_condition_minutes=row.get("pre_condition_minutes") or default_pre,
-            post_buffer_minutes=row.get("post_buffer_minutes") or default_post,
-            merge_gap_minutes=row.get("merge_gap_minutes") or default_gap,
+            pre_condition_minutes=_int_or_default(row.get("pre_condition_minutes"), default_pre),
+            post_buffer_minutes=_int_or_default(row.get("post_buffer_minutes"), default_post),
+            merge_gap_minutes=_int_or_default(row.get("merge_gap_minutes"), default_gap),
         )
 
     # 3) Buildings that are themselves bookable in 25Live (e.g. an atrium):
@@ -305,9 +320,9 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
             space_type="building",
             niagara_path=b["niagara_path"],
             building_schedule_path=None,
-            pre_condition_minutes=b.get("pre_condition_minutes") or default_pre,
-            post_buffer_minutes=b.get("post_buffer_minutes") or default_post,
-            merge_gap_minutes=b.get("merge_gap_minutes") or default_gap,
+            pre_condition_minutes=_int_or_default(b.get("pre_condition_minutes"), default_pre),
+            post_buffer_minutes=_int_or_default(b.get("post_buffer_minutes"), default_post),
+            merge_gap_minutes=_int_or_default(b.get("merge_gap_minutes"), default_gap),
         )
 
     n_rooms = sum(1 for s in space_map.values() if s.space_type == "room")
@@ -349,6 +364,20 @@ class CollegeNetClient:
         """Split a list into chunks of at most `size`."""
         return [items[i:i + size] for i in range(0, len(items), size)]
 
+    def _to_tz(self, dt_text: str) -> datetime:
+        """
+        Parse a 25Live datetime string into the configured timezone.
+
+        25Live returns instance-local timestamps. If the string is naive (no
+        offset), attach the configured tz — do NOT use .astimezone(), which
+        would assume the *server's* local tz and shift the time if the server
+        isn't in America/New_York. If it's already tz-aware, convert it.
+        """
+        dt = dateparser.parse(dt_text)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=self.tz)
+        return dt.astimezone(self.tz)
+
     def _find_space_ids(self, reservation: ET.Element) -> list[str]:
         """
         Robustly collect every space_id found anywhere under a reservation.
@@ -385,7 +414,7 @@ class CollegeNetClient:
         raw_events: list[RawEvent] = []
         offset = 0
 
-        while True:
+        for _page in range(MAX_PAGES):
             params = {
                 "space_id": " ".join(space_ids),     # space-separated IDs
                 "start_dt": start.strftime("%Y-%m-%dT00:00:00"),
@@ -415,13 +444,17 @@ class CollegeNetClient:
                     eid = ev.findtext("r25:event_id", "?", R25_NS)
                     logging.warning("Skipping malformed event %s: %s", eid, exc)
 
-            total = int(root.findtext("r25:total_count", "0", R25_NS) or 0)
-            returned = int(root.findtext("r25:return_count",
-                                         str(len(events)), R25_NS) or len(events))
-
-            if offset + returned >= total or returned == 0:
+            # Stop on the final (short) page. We deliberately do NOT rely on a
+            # total-count element being present: if the response omits it (or
+            # names it differently across API versions), stopping early would
+            # silently drop every event past the first page.
+            if len(events) < PAGE_SIZE:
                 break
             offset += PAGE_SIZE
+        else:
+            logging.warning(
+                "Reached MAX_PAGES (%d) while paging 25Live events for a batch; "
+                "results may be truncated.", MAX_PAGES)
 
         return raw_events
 
@@ -448,18 +481,16 @@ class CollegeNetClient:
             if not (start_txt and end_txt):
                 continue
 
-            event_start = dateparser.parse(start_txt).astimezone(self.tz)
-            event_end   = dateparser.parse(end_txt).astimezone(self.tz)
+            event_start = self._to_tz(start_txt)
+            event_end   = self._to_tz(end_txt)
 
             # 25Live's own setup/teardown times (present with scope=extended)
             native_pre_txt  = (res.findtext("r25:setup_dt", namespaces=R25_NS)
                                or res.findtext("r25:pre_event_dt", namespaces=R25_NS))
             native_post_txt = (res.findtext("r25:takedown_dt", namespaces=R25_NS)
                                or res.findtext("r25:post_event_dt", namespaces=R25_NS))
-            native_pre  = (dateparser.parse(native_pre_txt).astimezone(self.tz)
-                           if native_pre_txt else event_start)
-            native_post = (dateparser.parse(native_post_txt).astimezone(self.tz)
-                           if native_post_txt else event_end)
+            native_pre  = self._to_tz(native_pre_txt) if native_pre_txt else event_start
+            native_post = self._to_tz(native_post_txt) if native_post_txt else event_end
 
             # Which mapped spaces does this reservation touch?
             for space_id in self._find_space_ids(res):
@@ -590,10 +621,26 @@ class NiagaraClient:
                 "Niagara TLS verification is DISABLED (verify_tls=False). "
                 "Acceptable for a self-signed station cert on a trusted network; "
                 "for production, set verify_tls to a CA-bundle path.")
+            # Suppress the per-request InsecureRequestWarning so a nightly run
+            # with many writes doesn't flood the log. The warning above is the
+            # single, intentional notice.
+            from urllib3.exceptions import InsecureRequestWarning
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
         })
+
+    @staticmethod
+    def _encode_ord(path: str) -> str:
+        """
+        Percent-encode a Niagara ORD for use in a REST URL path, preserving the
+        ORD structure characters ('/', ':', '$') while encoding spaces and other
+        unsafe characters (schedule/component names often contain spaces). Part
+        of the N4.15 REST surface to confirm against your station — see the
+        class docstring.
+        """
+        return quote(path, safe="/:$")
 
     def health_check(self) -> bool:
         try:
@@ -611,7 +658,7 @@ class NiagaraClient:
         logging.info("Wrote %d windows to %s", len(windows), niagara_path)
 
     def _clear_special_events(self, path: str) -> None:
-        endpoint = f"{self.base}/{path}/specialEvents"
+        endpoint = f"{self.base}/{self._encode_ord(path)}/specialEvents"
         try:
             r = self.session.delete(endpoint, timeout=HTTP_TIMEOUT_WRITE)
             if r.status_code not in (200, 204, 404):
@@ -629,7 +676,7 @@ class NiagaraClient:
             "value": {"value": OCCUPIED_VALUE},        # True = Occupied
             "priority": BACNET_SCHEDULE_PRIORITY,
         }
-        endpoint = f"{self.base}/{path}/specialEvents"
+        endpoint = f"{self.base}/{self._encode_ord(path)}/specialEvents"
         r = self.session.post(endpoint, json=payload, timeout=HTTP_TIMEOUT_WRITE)
         if r.status_code not in (200, 201):
             raise RuntimeError(
@@ -640,7 +687,7 @@ class NiagaraClient:
         if not self.heartbeat_path:
             return
         stamp = datetime.now(self.tz).isoformat()
-        endpoint = f"{self.base}/{self.heartbeat_path}/out"
+        endpoint = f"{self.base}/{self._encode_ord(self.heartbeat_path)}/out"
         try:
             self.session.post(endpoint, json={"value": stamp},
                               timeout=HTTP_TIMEOUT_HEALTH)

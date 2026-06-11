@@ -28,9 +28,17 @@ an atrium), give the building a `space_id:` and its own events count too.
 
 ## Setup
 
+Requires **Python 3.9+** (uses `zoneinfo` and `list[...]`/`dict[...]` type hints).
+
 ```bash
 pip install -r requirements.txt
 ```
+
+> **Windows note:** `requirements.txt` includes `tzdata` on purpose — Windows
+> has no system timezone database, so without it `ZoneInfo("America/New_York")`
+> raises `ZoneInfoNotFoundError` and the sync won't start. Also make sure the
+> deps are installed for the **same** `python` that `Edit-Rooms.bat` and the
+> scheduled task invoke (use that interpreter for `pip install`).
 
 Set the two passwords as environment variables (never commit them):
 

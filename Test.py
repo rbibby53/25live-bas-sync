@@ -186,6 +186,43 @@ spaces:
     assert space_map["2"].merge_gap_minutes == CONFIG["collegenet"]["merge_gap_minutes"]
 
 
+def test_loader_preserves_explicit_zero_buffers():
+    """An explicit 0 for pre/post/merge_gap must be honored, not replaced by the
+    default (regression for the `value or default` coalescing bug)."""
+    yaml_text = """
+buildings: []
+spaces:
+  - space_id: 1
+    niagara_path: "B/Rm1"
+    pre_condition_minutes: 0
+    post_buffer_minutes: 0
+    merge_gap_minutes: 0
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        space_map = load_space_map(path, CONFIG)
+    finally:
+        os.unlink(path)
+    s = space_map["1"]
+    assert s.pre_condition_minutes == 0, s.pre_condition_minutes
+    assert s.post_buffer_minutes == 0, s.post_buffer_minutes
+    assert s.merge_gap_minutes == 0, s.merge_gap_minutes
+
+
+def test_naive_25live_datetime_uses_configured_tz():
+    """A naive 25Live timestamp is interpreted in the configured timezone, not
+    the server's local tz (regression for .astimezone() on a naive datetime)."""
+    import main
+    cn = main.CollegeNetClient(main.CONFIG["collegenet"], TZ)
+    d = cn._to_tz("2026-06-10T09:00:00")   # naive (no offset)
+    assert d.tzinfo is not None
+    # 09:00 is treated as 09:00 Eastern — wall-clock preserved, tz attached.
+    assert (d.hour, d.minute) == (9, 0), d
+    assert d.utcoffset() is not None
+
+
 def test_overlap_helper():
     """Sanity-check the OccupancyWindow overlap primitive directly."""
     a = OccupancyWindow(dt(9), dt(10))
