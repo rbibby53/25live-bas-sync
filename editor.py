@@ -28,6 +28,7 @@ The YAML read/write helpers (load_mapping / dump_mapping) are deliberately kept
 free of any GUI code so they can be unit-tested headlessly (see Test.py).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -258,9 +259,99 @@ def run_gui(map_path: Path) -> int:
             filem.add_separator()
             filem.add_command(label="Exit", command=self._on_close)
             bar.add_cascade(label="File", menu=filem)
+
+            toolm = Menu(bar, tearoff=0)
+            toolm.add_command(label="Test 25Live connection",
+                              command=self._test_25live)
+            toolm.add_command(label="Test Niagara connection",
+                              command=self._test_niagara)
+            toolm.add_separator()
+            toolm.add_command(label="Preview (dry run)…", command=self._preview)
+            bar.add_cascade(label="Tools", menu=toolm)
+
             self.config(menu=bar)
             self.bind_all("<Control-s>", lambda e: self._save())
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── tools (use the sync engine in main.py; need config.yaml) ──
+        def _runtime_config(self):
+            import main
+            cfg_path = (os.environ.get("BAS_CONFIG")
+                        or str(Path(__file__).parent / "config.yaml"))
+            cfg = main.load_config(cfg_path)
+            main.load_credentials(cfg)
+            return main, cfg
+
+        def _test_25live(self):
+            from zoneinfo import ZoneInfo
+            try:
+                main, cfg = self._runtime_config()
+                if not cfg["collegenet"].get("base_url"):
+                    messagebox.showwarning(
+                        "Test 25Live",
+                        "No 25Live instance/base_url in config.yaml.\n"
+                        "Copy config.example.yaml to config.yaml and set it.")
+                    return
+                cn = main.CollegeNetClient(cfg["collegenet"],
+                                           ZoneInfo(cfg["timezone"]), cfg.get("retry"))
+                ok, detail = cn.check_connection()
+                (messagebox.showinfo if ok else messagebox.showerror)(
+                    "Test 25Live", f"{'Connected' if ok else 'FAILED'}\n\n{detail}")
+            except Exception as exc:
+                messagebox.showerror("Test 25Live", f"Error: {exc}")
+
+        def _test_niagara(self):
+            from zoneinfo import ZoneInfo
+            try:
+                main, cfg = self._runtime_config()
+                n4 = main.NiagaraClient(cfg["niagara"],
+                                        ZoneInfo(cfg["timezone"]), cfg.get("retry"))
+                ok = n4.health_check()
+                (messagebox.showinfo if ok else messagebox.showerror)(
+                    "Test Niagara",
+                    "Reachable (HTTP 200 from /about)." if ok
+                    else "Unreachable — check niagara host/port/TLS in config.yaml.")
+            except Exception as exc:
+                messagebox.showerror("Test Niagara", f"Error: {exc}")
+
+        def _preview(self):
+            import io
+            import logging as _logging
+            if self.dirty and messagebox.askyesno(
+                    "Preview",
+                    "Preview uses the SAVED file, but you have unsaved changes.\n"
+                    "Save first?"):
+                if not self._save():
+                    return
+            try:
+                main, cfg = self._runtime_config()
+                cfg["space_map_file"] = str(self.path)
+                buf = io.StringIO()
+                handler = _logging.StreamHandler(buf)
+                handler.setFormatter(_logging.Formatter("%(levelname)-7s %(message)s"))
+                root = _logging.getLogger()
+                root.addHandler(handler)
+                prev = root.level
+                root.setLevel(_logging.INFO)
+                try:
+                    main.run_sync(cfg, dry_run=True)
+                finally:
+                    root.removeHandler(handler)
+                    root.setLevel(prev)
+                self._show_text("Preview (dry run)", buf.getvalue() or "(no output)")
+            except Exception as exc:
+                messagebox.showerror("Preview", f"Error: {exc}")
+
+        def _show_text(self, title: str, text: str):
+            win = tk.Toplevel(self)
+            win.title(title)
+            win.geometry("720x460")
+            win.transient(self)
+            txt = tk.Text(win, wrap="none")
+            txt.insert("1.0", text)
+            txt.config(state="disabled")
+            txt.pack(fill="both", expand=True)
+            ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
 
         def _on_open(self):
             if not self._confirm_discard():

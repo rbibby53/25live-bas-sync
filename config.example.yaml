@@ -43,6 +43,28 @@ niagara:
 # America/Denver, America/Los_Angeles).
 timezone: "America/New_York"
 
+# Retry transient 25Live/Niagara errors (timeouts, 429, 5xx). Applied to reads
+# and the idempotent clear; writes are not auto-retried.
+retry:
+  attempts: 3
+  backoff_seconds: 2.0
+
+# Notify on a failed (or optionally successful) sync run. Off by default.
+# Email SMTP password comes from the env var BAS_SMTP_PASSWORD.
+alerts:
+  enabled: false
+  notify_on_success: false
+  webhook_url: ""               # Slack/Teams/generic incoming webhook URL
+  email:
+    enabled: false
+    smtp_host: "smtp.example.edu"
+    smtp_port: 587
+    use_tls: true
+    username: "alerts@example.edu"
+    from_addr: "alerts@example.edu"
+    to_addrs:
+      - "facilities@example.edu"
+
 # Optional overrides (sensible defaults are used if omitted):
 # space_map_file: "space_mapping.yaml"
 # log_file: "logs/25live_sync.log"
