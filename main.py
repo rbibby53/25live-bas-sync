@@ -43,6 +43,7 @@ map lives in space_mapping.yaml (edit by hand or via editor.py).
 import os
 import sys
 import copy
+import smtplib
 import logging
 import argparse
 import xml.etree.ElementTree as ET
@@ -51,12 +52,15 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from dataclasses import dataclass, field
+from email.message import EmailMessage
 from typing import Optional
 from urllib.parse import quote
 
 import requests
 import yaml
 from dateutil import parser as dateparser
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +152,31 @@ DEFAULTS = {
 
     "timezone": "America/New_York",           # your campus timezone (IANA name)
 
+    # ── Resilience: retry transient 25Live/Niagara errors (timeouts, 5xx) ──
+    # Applied to reads and the idempotent clear; writes (POST) are not auto-
+    # retried, to avoid duplicate special events.
+    "retry": {
+        "attempts": 3,                        # retries per request
+        "backoff_seconds": 2.0,               # exponential backoff base
+    },
+
+    # ── Alerting: notify on a failed (or optionally successful) sync run ──
+    # Off by default. Email SMTP password comes from env var BAS_SMTP_PASSWORD.
+    "alerts": {
+        "enabled": False,
+        "notify_on_success": False,
+        "webhook_url": "",                    # Slack/Teams/generic incoming webhook
+        "email": {
+            "enabled": False,
+            "smtp_host": "",
+            "smtp_port": 587,
+            "use_tls": True,
+            "username": "",                   # SMTP user (password: BAS_SMTP_PASSWORD)
+            "from_addr": "",
+            "to_addrs": [],
+        },
+    },
+
     # Room map YAML (same folder as this script by default).
     "space_map_file": str(Path(__file__).parent / "space_mapping.yaml"),
 
@@ -222,6 +251,77 @@ def load_credentials(config: dict) -> None:
                 "%s password is still the placeholder — set %s before a live run.",
                 section, env_var,
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP retry + alerting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mount_retries(session: requests.Session, retry: Optional[dict],
+                   allowed_methods) -> None:
+    """
+    Mount a urllib3 Retry adapter so transient errors (connection failures,
+    timeouts, 429/5xx) are retried with exponential backoff. `allowed_methods`
+    limits which HTTP verbs auto-retry — we pass only safe/idempotent ones
+    (GET, DELETE) so writes (POST) never replay and create duplicate events.
+    """
+    if not retry:
+        return
+    policy = Retry(
+        total=retry.get("attempts", 3),
+        connect=retry.get("attempts", 3),
+        read=retry.get("attempts", 3),
+        status=retry.get("attempts", 3),
+        backoff_factor=retry.get("backoff_seconds", 2.0),
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(allowed_methods),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=policy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
+def send_alert(alerts_cfg: dict, subject: str, body: str) -> None:
+    """
+    Best-effort notification on a failed (or optionally successful) run. Sends
+    to a webhook (Slack/Teams/generic) and/or email if configured. Never raises
+    — an alerting problem must not change the run's outcome.
+    """
+    if not alerts_cfg or not alerts_cfg.get("enabled"):
+        return
+
+    url = alerts_cfg.get("webhook_url")
+    if url:
+        try:
+            requests.post(url, json={"text": f"{subject}\n\n{body}"}, timeout=15)
+        except requests.RequestException as exc:
+            logging.warning("Alert webhook failed: %s", exc)
+
+    email = alerts_cfg.get("email") or {}
+    if email.get("enabled"):
+        try:
+            _send_email(email, subject, body)
+        except Exception as exc:
+            logging.warning("Alert email failed: %s", exc)
+
+
+def _send_email(email_cfg: dict, subject: str, body: str) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = email_cfg.get("from_addr", "")
+    msg["To"] = ", ".join(email_cfg.get("to_addrs", []))
+    msg.set_content(body)
+    with smtplib.SMTP(email_cfg.get("smtp_host"),
+                      email_cfg.get("smtp_port", 587), timeout=20) as smtp:
+        if email_cfg.get("use_tls", True):
+            smtp.starttls()
+        user = email_cfg.get("username")
+        password = os.environ.get("BAS_SMTP_PASSWORD")
+        if user and password:
+            smtp.login(user, password)
+        smtp.send_message(msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,7 +490,7 @@ class CollegeNetClient:
     Response:  XML in the http://www.collegenet.com/r25 namespace
     """
 
-    def __init__(self, cfg: dict, tz: ZoneInfo):
+    def __init__(self, cfg: dict, tz: ZoneInfo, retry: Optional[dict] = None):
         self.base_url = cfg["base_url"].rstrip("/")
         self.lookahead_days = cfg["lookahead_days"]
         self.include_states = set(cfg["include_states"])
@@ -399,11 +499,89 @@ class CollegeNetClient:
         self.session = requests.Session()
         self.session.auth = (cfg["username"], cfg["password"])
         self.session.headers.update({"Accept": "application/xml"})
+        _mount_retries(self.session, retry, allowed_methods=["GET"])
+
+    def _state_param(self) -> str:
+        return "+".join(str(s) for s in sorted(self.include_states))
 
     @staticmethod
     def _local(tag: str) -> str:
         """Strip the namespace prefix from an XML tag."""
         return tag.rsplit("}", 1)[-1]
+
+    def _child_text(self, elem: ET.Element, local_name: str) -> Optional[str]:
+        """Text of the first direct child whose local tag name matches."""
+        for child in elem:
+            if self._local(child.tag) == local_name and child.text:
+                return child.text.strip()
+        return None
+
+    def check_connection(self) -> tuple[bool, str]:
+        """
+        Lightweight authenticated request to confirm reachability + credentials,
+        used by --validate. Returns (ok, detail). A 401/403 means the account or
+        password is wrong; anything else that responds means we reached and
+        authenticated against the service.
+        """
+        now = datetime.now(self.tz)
+        params = {
+            "start_dt": now.strftime("%Y-%m-%dT00:00:00"),
+            "end_dt":   now.strftime("%Y-%m-%dT23:59:59"),
+            "state":    self._state_param(),
+            "page_size": 1,
+        }
+        try:
+            r = self.session.get(f"{self.base_url}/events.xml", params=params,
+                                 timeout=HTTP_TIMEOUT_HEALTH)
+        except requests.RequestException as exc:
+            return False, f"connection error: {exc}"
+        if r.status_code in (401, 403, 407):
+            return False, (f"auth failed (HTTP {r.status_code}) — check username "
+                           "and BAS_25LIVE_PASSWORD")
+        return True, f"HTTP {r.status_code}"
+
+    def discover_spaces(self, days: int) -> list[dict]:
+        """
+        Return distinct {space_id, space_name} seen in events over the next
+        `days` days. Uses the SAME events endpoint as the sync (no extra API
+        surface to validate), so it finds spaces that have bookings in the
+        window — handy for first-time mapping. Spaces with no upcoming events
+        won't appear; widen `days` to surface more.
+        """
+        now = datetime.now(self.tz)
+        end = now + timedelta(days=days)
+        seen: dict[str, str] = {}
+        offset = 0
+        for _page in range(MAX_PAGES):
+            params = {
+                "start_dt": now.strftime("%Y-%m-%dT00:00:00"),
+                "end_dt":   end.strftime("%Y-%m-%dT23:59:59"),
+                "scope":    "extended",
+                "state":    self._state_param(),
+                "page_size": PAGE_SIZE,
+                "page_offset": offset,
+            }
+            r = self.session.get(f"{self.base_url}/events.xml", params=params,
+                                 timeout=HTTP_TIMEOUT_FETCH)
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            events = root.findall("r25:event", R25_NS)
+            self._collect_spaces_from(root, seen)
+            if len(events) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        return [{"space_id": sid, "space_name": name}
+                for sid, name in sorted(seen.items(), key=lambda kv: kv[1].lower())]
+
+    def _collect_spaces_from(self, root: ET.Element, into: dict) -> None:
+        """Collect {space_id: space_name} from any element that has a space_id
+        child (the space_reservation), preferring space_name then formal_name."""
+        for elem in root.iter():
+            sid = self._child_text(elem, "space_id")
+            if sid:
+                name = (self._child_text(elem, "space_name")
+                        or self._child_text(elem, "formal_name") or sid)
+                into.setdefault(sid, name)
 
     @staticmethod
     def _chunk(items: list[str], size: int) -> list[list[str]]:
@@ -470,8 +648,8 @@ class CollegeNetClient:
                 # query param, not include=confirmed. We derive it from
                 # include_states so CONFIG actually drives the request. If your
                 # 25Live instance expects a different format (e.g. comma- vs
-                # plus-separated), this is the one line to adjust.
-                "state":    "+".join(str(s) for s in sorted(self.include_states)),
+                # plus-separated), change _state_param().
+                "state":    self._state_param(),
                 "page_size": PAGE_SIZE,
                 "page_offset": offset,
             }
@@ -653,7 +831,7 @@ class NiagaraClient:
     Workbench "rest" service) and run --dry-run first — it never calls these.
     """
 
-    def __init__(self, cfg: dict, tz: ZoneInfo):
+    def __init__(self, cfg: dict, tz: ZoneInfo, retry: Optional[dict] = None):
         proto = "https" if cfg["https"] else "http"
         self.base = f"{proto}://{cfg['host']}:{cfg['port']}{NIAGARA_REST_BASE}"
         self.schedule_base = cfg["schedule_base_path"]
@@ -661,6 +839,10 @@ class NiagaraClient:
         self.tz = tz
         self.session = requests.Session()
         self.session.auth = (cfg["username"], cfg["password"])
+        # Retry only safe/idempotent verbs — GET (reads) and DELETE (the clear
+        # step). POST writes are intentionally excluded so a retry can't create
+        # duplicate special events.
+        _mount_retries(self.session, retry, allowed_methods=["GET", "DELETE"])
         self.session.verify = cfg.get("verify_tls", False)
         if not self.session.verify:
             logging.warning(
@@ -694,6 +876,20 @@ class NiagaraClient:
             return r.status_code == 200
         except requests.RequestException as exc:
             logging.error("Niagara health check failed: %s", exc)
+            return False
+
+    def schedule_exists(self, niagara_path: str) -> bool:
+        """
+        True if the schedule component at this path resolves (HTTP 200), used by
+        --validate to catch typos before a live run. Subject to the same REST
+        contract caveats as the writes (see class docstring).
+        """
+        full = f"{self.schedule_base}/{niagara_path}"
+        endpoint = f"{self.base}/{self._encode_ord(full)}"
+        try:
+            r = self.session.get(endpoint, timeout=HTTP_TIMEOUT_HEALTH)
+            return r.status_code == 200
+        except requests.RequestException:
             return False
 
     def write_schedule(self, niagara_path: str, windows: list[OccupancyWindow]) -> None:
@@ -768,7 +964,7 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
             "Did you copy config.example.yaml to config.yaml?")
         return 4
 
-    cn = CollegeNetClient(cfg["collegenet"], tz)
+    cn = CollegeNetClient(cfg["collegenet"], tz, cfg.get("retry"))
     builder = ScheduleBuilder(cfg["collegenet"]["merge_gap_minutes"])
 
     try:
@@ -787,7 +983,7 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
                 logging.info("      %s", w)
         return 0
 
-    n4 = NiagaraClient(cfg["niagara"], tz)
+    n4 = NiagaraClient(cfg["niagara"], tz, cfg.get("retry"))
     if not n4.health_check():
         logging.error("Niagara station unreachable — aborting this run.")
         return 3
@@ -821,6 +1017,94 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
     return 0
 
 
+def _schedule_paths(space_map: dict[str, SpaceConfig]) -> set:
+    """All distinct Niagara schedule paths the sync would write (rooms +
+    building roll-ups)."""
+    paths = set()
+    for sc in space_map.values():
+        paths.add(sc.niagara_path)
+        if sc.building_schedule_path:
+            paths.add(sc.building_schedule_path)
+    return paths
+
+
+def run_validate(cfg: dict) -> int:
+    """
+    Pre-flight check (no writes): config, 25Live auth, Niagara reachability, and
+    that every schedule ORD exists. Logs a PASS/FAIL summary. Returns 0 if all
+    checks pass, else 6.
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    checks: list[tuple[str, bool, str]] = []
+
+    space_map = load_space_map(cfg["space_map_file"], cfg)
+    checks.append(("Room map loads",
+                   bool(space_map),
+                   f"{len(space_map)} spaces" if space_map else "empty or missing"))
+
+    base_url = cfg["collegenet"].get("base_url")
+    checks.append(("25Live base_url configured",
+                   bool(base_url),
+                   base_url or "set collegenet.instance or base_url"))
+
+    if base_url:
+        cn = CollegeNetClient(cfg["collegenet"], tz, cfg.get("retry"))
+        ok, detail = cn.check_connection()
+        checks.append(("25Live reachable + authenticated", ok, detail))
+
+    n4 = NiagaraClient(cfg["niagara"], tz, cfg.get("retry"))
+    reachable = n4.health_check()
+    checks.append(("Niagara reachable",
+                   reachable,
+                   f"{n4.base}/about" if reachable else "unreachable (check host/port/TLS)"))
+
+    if reachable and space_map:
+        missing = sorted(p for p in _schedule_paths(space_map)
+                         if not n4.schedule_exists(p))
+        checks.append(("Niagara schedules exist",
+                       not missing,
+                       "all present" if not missing
+                       else f"{len(missing)} missing: {', '.join(missing)}"))
+
+    logging.info("=== Validation results ===")
+    for name, ok, detail in checks:
+        logging.info("  [%-4s] %s — %s", "PASS" if ok else "FAIL", name, detail)
+
+    all_ok = all(ok for _, ok, _ in checks)
+    logging.info("=== Validation %s ===", "PASSED" if all_ok else "FAILED")
+    return 0 if all_ok else 6
+
+
+def run_discover(cfg: dict, days: int) -> int:
+    """
+    List 25Live spaces that have events in the next `days` days, as a starter
+    for space_mapping.yaml. Read-only; never writes anything.
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    if not cfg["collegenet"].get("base_url"):
+        logging.error("25Live base_url is not set — configure collegenet.instance "
+                      "or base_url in config.yaml.")
+        return 4
+
+    cn = CollegeNetClient(cfg["collegenet"], tz, cfg.get("retry"))
+    try:
+        spaces = cn.discover_spaces(days)
+    except requests.RequestException as exc:
+        logging.error("Discovery failed: %s", exc)
+        return 4
+
+    logging.info("Discovered %d space(s) with events in the next %d days:",
+                 len(spaces), days)
+    # Print a YAML-ish starter block operators can paste into space_mapping.yaml.
+    lines = ["", "# --- discovered spaces (add building + niagara_path) ---", "spaces:"]
+    for s in spaces:
+        lines.append(f"  - space_id: {s['space_id']}")
+        lines.append(f"    space_name: \"{s['space_name']}\"")
+        lines.append(f"    niagara_path: \"\"   # TODO: set the Niagara schedule slot")
+    print("\n".join(lines))
+    return 0
+
+
 def setup_logging(log_file: str) -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     try:
@@ -837,6 +1121,17 @@ def setup_logging(log_file: str) -> None:
     )
 
 
+# Human-readable hints for the sync exit codes (used in failure alerts).
+EXIT_CODE_HELP = {
+    1: "Unhandled error (see the log).",
+    2: "Room map empty or missing.",
+    3: "Niagara station unreachable.",
+    4: "25Live fetch failed (auth, network, or config).",
+    5: "One or more Niagara writes failed.",
+    6: "Validation failed.",
+}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="25Live -> Niagara schedule sync (single run).")
@@ -845,6 +1140,13 @@ def main() -> int:
     parser.add_argument("--space-map", help="Override path to space_mapping.yaml")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and build schedules but do not write to Niagara")
+    parser.add_argument("--validate", action="store_true",
+                        help="Pre-flight checks only (config, auth, reachability, "
+                             "schedule ORDs); no writes")
+    parser.add_argument("--discover", action="store_true",
+                        help="List 25Live spaces with upcoming events (read-only)")
+    parser.add_argument("--discover-days", type=int, default=30,
+                        help="Window for --discover, in days (default 30)")
     args = parser.parse_args()
 
     cfg_path = (args.config or os.environ.get("BAS_CONFIG")
@@ -864,12 +1166,39 @@ def main() -> int:
             cfg_path)
     load_credentials(cfg)   # after logging is up, so warnings are captured
 
-    logging.info("=== 25Live -> Niagara sync starting (lookahead %d days%s) ===",
-                 cfg["collegenet"]["lookahead_days"],
-                 ", DRY RUN" if args.dry_run else "")
+    # A "live sync" is the only mode that alerts; --validate/--discover/--dry-run
+    # are interactive and just return a code.
+    is_live_sync = not (args.validate or args.discover or args.dry_run)
 
-    code = run_sync(cfg, dry_run=args.dry_run)
-    logging.info("=== Sync exited with code %d ===", code)
+    mode = ("VALIDATE" if args.validate else "DISCOVER" if args.discover
+            else "DRY RUN" if args.dry_run else "SYNC")
+    logging.info("=== 25Live -> Niagara starting (%s, lookahead %d days) ===",
+                 mode, cfg["collegenet"]["lookahead_days"])
+
+    try:
+        if args.validate:
+            code = run_validate(cfg)
+        elif args.discover:
+            code = run_discover(cfg, args.discover_days)
+        else:
+            code = run_sync(cfg, dry_run=args.dry_run)
+    except Exception as exc:                       # noqa: BLE001 — last-resort guard
+        logging.exception("Unhandled error during run")
+        code = 1
+        if is_live_sync:
+            send_alert(cfg["alerts"], "25Live -> Niagara sync CRASHED",
+                       f"Unhandled error: {exc}")
+
+    if is_live_sync:
+        if code != 0:
+            send_alert(cfg["alerts"],
+                       f"25Live -> Niagara sync FAILED (exit {code})",
+                       EXIT_CODE_HELP.get(code, "See the log for details."))
+        elif cfg["alerts"].get("notify_on_success"):
+            send_alert(cfg["alerts"], "25Live -> Niagara sync OK",
+                       "Sync completed successfully.")
+
+    logging.info("=== Exited with code %d ===", code)
     return code
 
 

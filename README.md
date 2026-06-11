@@ -20,9 +20,11 @@ It's a single-run script meant to be scheduled nightly. It's read-only against
 - Merges overlapping/adjacent bookings into clean occupancy windows.
 - **Building roll-up**: every room in a building automatically unions into that
   building's schedule — if *any* room is occupied, common areas run too.
-- A small **Tkinter GUI** (`editor.py`) so non-developers can manage the room map.
-- `--dry-run` mode, structured logging, a monitoring heartbeat, and exit codes for
-  alerting.
+- A small **Tkinter GUI** (`editor.py`) so non-developers can manage the room map,
+  with built-in *Test connection* and *Preview* tools.
+- `--dry-run`, `--validate` (pre-flight), and `--discover` modes; structured
+  logging; a monitoring heartbeat; **automatic retries**; and **failure alerts**
+  (webhook/email).
 
 ## How it works
 
@@ -105,6 +107,8 @@ Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
   your defined buildings, so a room joins its roll-up just by picking it.
 - **Buildings** tab — manage roll-up schedules; renaming a building id repoints the
   rooms that referenced it.
+- **Tools** menu — *Test 25Live connection*, *Test Niagara connection*, and
+  *Preview (dry run)* run against your `config.yaml` without leaving the editor.
 
 It validates required fields and duplicate IDs, warns on missing-building
 references, and keeps a `.bak` of the previous version on save.
@@ -116,13 +120,32 @@ references, and keeps a `.bak` of the previous version on save.
 ## Running
 
 ```bash
+python main.py --validate    # pre-flight: config, auth, reachability, ORDs exist (no writes)
+python main.py --discover    # list 25Live spaces with upcoming events (read-only)
 python main.py --dry-run     # fetch + build, print what WOULD be written (no writes)
 python main.py               # live run (writes to Niagara)
 python main.py --config /etc/25live/config.yaml --space-map /etc/25live/rooms.yaml
 ```
 
-Exit codes (for monitoring): `0` ok · `2` empty/missing room map · `3` Niagara
-unreachable · `4` 25Live fetch failed · `5` one or more write failures.
+- **`--validate`** is the deployment-confidence command: it checks the room map
+  loads, 25Live authenticates, Niagara is reachable, and **every schedule ORD
+  exists** — without writing anything. Run it first.
+- **`--discover`** (optionally `--discover-days N`, default 30) lists spaces that
+  have bookings, as a starter you can paste into `space_mapping.yaml`.
+
+Exit codes (for monitoring): `0` ok · `1` unhandled error · `2` empty/missing room
+map · `3` Niagara unreachable · `4` 25Live fetch failed · `5` write failures ·
+`6` validation failed.
+
+## Reliability & alerts
+
+- **Retries** — transient 25Live/Niagara errors (timeouts, 429, 5xx) are retried
+  with exponential backoff (`retry:` in config). Reads and the idempotent clear
+  retry; writes do not, so a retry can't create duplicate events.
+- **Alerts** — set `alerts.enabled: true` to get a **webhook** (Slack/Teams/
+  generic) and/or **email** notification when a run fails (or, optionally, on
+  success). The SMTP password comes from the `BAS_SMTP_PASSWORD` env var. Pair
+  this with the Niagara heartbeat point for end-to-end monitoring.
 
 ## Scheduling
 
@@ -194,8 +217,8 @@ support other 25Live/Niagara configurations are especially valuable.
 
 ## License
 
-Licensed under the **GNU General Public License v3.0** (see source headers; add the
-full `LICENSE` text to the repo). Copyright © 2026 Ryan Bibby and contributors.
+Licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
+Copyright © 2026 Ryan Bibby and contributors.
 
 ## Disclaimer
 
@@ -216,3 +239,6 @@ against your own 25Live instance and Niagara station.
 | `requirements.txt`           | Python dependencies.                                |
 | `Test.py`                    | Offline tests for the merge logic + editor I/O.     |
 | `CONTRIBUTING.md`            | How to contribute.                                  |
+| `CHANGELOG.md`               | Notable changes.                                    |
+| `LICENSE`                    | GPL-3.0 license text.                               |
+| `.github/workflows/ci.yml`   | CI: byte-compile + offline tests (Python 3.9, 3.12).|

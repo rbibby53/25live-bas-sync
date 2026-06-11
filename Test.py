@@ -336,6 +336,62 @@ timezone: America/Chicago
     assert cfg2["collegenet"]["lookahead_days"] == 7
 
 
+def test_discover_collects_spaces_from_xml():
+    """discover_spaces' parsing pulls space_id + space_name out of event XML."""
+    import xml.etree.ElementTree as ET
+    import main
+    cn = main.CollegeNetClient(main.CONFIG["collegenet"], TZ)
+    xml = """<r25:results xmlns:r25="http://www.collegenet.com/r25">
+      <r25:event><r25:reservations><r25:reservation><r25:space_reservation>
+        <r25:space_id>101</r25:space_id><r25:space_name>Room A</r25:space_name>
+      </r25:space_reservation></r25:reservation></r25:reservations></r25:event>
+      <r25:event><r25:reservations><r25:reservation><r25:space_reservation>
+        <r25:space_id>102</r25:space_id><r25:formal_name>Room B Formal</r25:formal_name>
+      </r25:space_reservation></r25:reservation></r25:reservations></r25:event>
+    </r25:results>"""
+    seen: dict = {}
+    cn._collect_spaces_from(ET.fromstring(xml), seen)
+    assert seen == {"101": "Room A", "102": "Room B Formal"}, seen
+
+
+def test_retry_adapter_excludes_post_for_writes():
+    """The Niagara session retries GET/DELETE but never POST, so a retry can't
+    create duplicate special events."""
+    import main
+    n4 = main.NiagaraClient(main.CONFIG["niagara"], TZ,
+                            {"attempts": 2, "backoff_seconds": 0})
+    methods = set(n4.session.get_adapter("https://x").max_retries.allowed_methods)
+    assert "GET" in methods and "DELETE" in methods, methods
+    assert "POST" not in methods, methods
+
+
+def test_send_alert_webhook_and_disabled():
+    """send_alert posts to the webhook when enabled, and is a no-op when not."""
+    import main
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        captured["url"] = url
+        captured["json"] = json
+        class _R:
+            status_code = 200
+        return _R()
+
+    original = main.requests.post
+    main.requests.post = fake_post
+    try:
+        main.send_alert({"enabled": True, "webhook_url": "http://hook"},
+                        "Subject X", "Body Y")
+        assert captured.get("url") == "http://hook"
+        assert "Subject X" in captured["json"]["text"]
+
+        captured.clear()
+        main.send_alert({"enabled": False, "webhook_url": "http://hook"}, "s", "b")
+        assert captured == {}, "disabled alerts must not post"
+    finally:
+        main.requests.post = original
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0
