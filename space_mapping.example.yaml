@@ -26,6 +26,11 @@
 #   niagara_path  (required)  the building roll-up schedule slot, RELATIVE to
 #                             niagara.schedule_base_path in config.yaml
 #                             (default slot:/Schedules)
+#   pre_condition_minutes (optional)  building-wide run-up default for ITS rooms;
+#                             beats the global default but a room can still
+#                             override it (precedence: room > building > global)
+#   post_buffer_minutes   (optional)  building-wide run-down default for ITS rooms
+#                             (same precedence)
 #   space_id      (optional)  ONLY if the building common area is itself bookable
 #                             in 25Live (e.g. an atrium); its own events then also
 #                             count toward the building schedule
@@ -38,8 +43,10 @@
 #                                     Omit for a room that should run on its own
 #                                     and NOT drive any building schedule.
 #   niagara_path          (required)  this room's own schedule slot
-#   pre_condition_minutes (optional)  HVAC lead time BEFORE events (default 30)
-#   post_buffer_minutes   (optional)  hold time AFTER events (default 15)
+#   pre_condition_minutes (optional)  HVAC lead time BEFORE events. Precedence:
+#                                     room > building > global default (30)
+#   post_buffer_minutes   (optional)  hold time AFTER events. Precedence:
+#                                     room > building > global default (15)
 #   merge_gap_minutes     (optional)  collapse this room's back-to-back windows
 #                                     that are within this many minutes
 #                                     (default 5). Merges ACROSS rooms (the
@@ -60,6 +67,8 @@ buildings:
   - id: eng_tech
     name: "Engineering Technology"
     niagara_path: "EngTech/Building_Occ"
+    pre_condition_minutes: 40   # whole building warms up early; rooms may override
+    post_buffer_minutes: 20
 
   - id: student_center
     name: "Student Center"

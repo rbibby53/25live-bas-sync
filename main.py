@@ -208,12 +208,26 @@ def _deep_merge(base: dict, override: dict) -> None:
             base[key] = val
 
 
-def load_config(path: str) -> dict:
+# Global scheduling defaults live in defaults.yaml — a small, GUI-editable file
+# (run-up / run-down / merge-gap / lookahead). These flat keys map onto the
+# internal config so the rest of the code is unchanged.
+DEFAULTS_FILE_MAP = {
+    "pre_condition_minutes": "default_pre_condition_minutes",
+    "post_buffer_minutes":   "default_post_buffer_minutes",
+    "merge_gap_minutes":     "merge_gap_minutes",
+    "lookahead_days":        "lookahead_days",
+}
+
+
+def load_config(path: str, defaults_path: Optional[str] = None) -> dict:
     """
-    Build the runtime config: a deep copy of DEFAULTS with config.yaml merged
-    over it. A missing file just yields the defaults (main() warns about it).
-    If collegenet.base_url is blank, it's derived from collegenet.instance.
-    Secrets are applied separately by load_credentials().
+    Build the runtime config: a deep copy of DEFAULTS, with config.yaml merged
+    over it, then the global scheduling defaults from defaults.yaml applied on
+    top. defaults.yaml is the single, GUI-editable home for the run-up/run-down/
+    merge-gap/lookahead defaults; connection/auth settings stay in config.yaml.
+    A missing file just leaves the built-ins in place. If collegenet.base_url is
+    blank, it's derived from collegenet.instance. Secrets are applied separately
+    by load_credentials().
     """
     cfg = copy.deepcopy(DEFAULTS)
     p = Path(path)
@@ -221,6 +235,13 @@ def load_config(path: str) -> dict:
         with open(p, "r", encoding="utf-8") as fh:
             user = yaml.safe_load(fh) or {}
         _deep_merge(cfg, user)
+
+    if defaults_path and Path(defaults_path).exists():
+        with open(defaults_path, "r", encoding="utf-8") as fh:
+            gd = yaml.safe_load(fh) or {}
+        for file_key, cfg_key in DEFAULTS_FILE_MAP.items():
+            if gd.get(file_key) is not None:
+                cfg["collegenet"][cfg_key] = gd[file_key]
 
     cn = cfg["collegenet"]
     if not cn.get("base_url"):
@@ -390,6 +411,20 @@ def _int_or_default(value, default: int) -> int:
     return default if value is None else int(value)
 
 
+def _resolve_minutes(room_value, building_value, default: int) -> int:
+    """
+    Resolve a per-room minutes setting (run-up / run-down) with precedence:
+        room override > building override > global default.
+    A value counts as "set" only when not None, so an explicit 0 is honored at
+    any level (same rationale as _int_or_default).
+    """
+    if room_value is not None:
+        return int(room_value)
+    if building_value is not None:
+        return int(building_value)
+    return default
+
+
 def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
     """
     Parse space_mapping.yaml into { space_id: SpaceConfig }.
@@ -405,7 +440,8 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
     you just give the building id, which makes "all rooms in the building" the
     default and removes the chance of forgetting one.
 
-    Per-room pre/post overrides fall back to the global defaults.
+    Run-up (pre_condition_minutes) and run-down (post_buffer_minutes) resolve
+    with precedence: room override > building override > global default.
     """
     default_pre = cfg["collegenet"]["default_pre_condition_minutes"]
     default_post = cfg["collegenet"]["default_post_buffer_minutes"]
@@ -430,6 +466,7 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
     for row in data.get("spaces", []):
         space_id = str(row["space_id"])
         building_path: Optional[str] = None
+        building: Optional[dict] = None
         building_id = row.get("building")
         if building_id is not None:
             building_id = str(building_id)
@@ -442,14 +479,20 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
             else:
                 building_path = building["niagara_path"]
 
+        bld = building or {}
         space_map[space_id] = SpaceConfig(
             space_id=space_id,
             space_name=row.get("space_name", space_id),
             space_type="room",
             niagara_path=row["niagara_path"],
             building_schedule_path=building_path,
-            pre_condition_minutes=_int_or_default(row.get("pre_condition_minutes"), default_pre),
-            post_buffer_minutes=_int_or_default(row.get("post_buffer_minutes"), default_post),
+            # Run-up / run-down: room override > building override > global default.
+            pre_condition_minutes=_resolve_minutes(
+                row.get("pre_condition_minutes"),
+                bld.get("pre_condition_minutes"), default_pre),
+            post_buffer_minutes=_resolve_minutes(
+                row.get("post_buffer_minutes"),
+                bld.get("post_buffer_minutes"), default_post),
             merge_gap_minutes=_int_or_default(row.get("merge_gap_minutes"), default_gap),
         )
 
@@ -1137,6 +1180,8 @@ def main() -> int:
         description="25Live -> Niagara schedule sync (single run).")
     parser.add_argument("--config",
                         help="Path to config.yaml (default: ./config.yaml, or $BAS_CONFIG)")
+    parser.add_argument("--defaults",
+                        help="Path to defaults.yaml (default: ./defaults.yaml, or $BAS_DEFAULTS)")
     parser.add_argument("--space-map", help="Override path to space_mapping.yaml")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and build schedules but do not write to Niagara")
@@ -1151,7 +1196,9 @@ def main() -> int:
 
     cfg_path = (args.config or os.environ.get("BAS_CONFIG")
                 or str(Path(__file__).parent / "config.yaml"))
-    cfg = load_config(cfg_path)
+    defaults_path = (args.defaults or os.environ.get("BAS_DEFAULTS")
+                     or str(Path(__file__).parent / "defaults.yaml"))
+    cfg = load_config(cfg_path, defaults_path)
 
     if args.space_map:
         cfg["space_map_file"] = args.space_map

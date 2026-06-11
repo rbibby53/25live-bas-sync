@@ -50,10 +50,28 @@ FILE_HEADER = """\
 """
 
 # Field order we emit so the file reads cleanly and diffs stay stable.
-BUILDING_KEY_ORDER = ["id", "name", "niagara_path", "space_id"]
+BUILDING_KEY_ORDER = ["id", "name", "niagara_path",
+                      "pre_condition_minutes", "post_buffer_minutes", "space_id"]
 ROOM_KEY_ORDER = ["space_id", "space_name", "building", "niagara_path",
                   "pre_condition_minutes", "post_buffer_minutes",
                   "merge_gap_minutes", "note"]
+
+DEFAULT_DEFAULTS_FILE = Path(__file__).parent / "defaults.yaml"
+
+# Global scheduling defaults shown on the "Defaults" tab:
+# (yaml key, label, built-in fallback).
+DEFAULTS_FIELDS = [
+    ("pre_condition_minutes", "Run-up (pre-condition) minutes", 30),
+    ("post_buffer_minutes",   "Run-down (post-buffer) minutes", 15),
+    ("merge_gap_minutes",     "Merge-gap minutes", 5),
+    ("lookahead_days",        "Lookahead days", 7),
+]
+
+DEFAULTS_HEADER = """\
+# Global scheduling defaults. Edit here or via the editor's "Defaults" tab.
+# Rooms/buildings may override pre/post in space_mapping.yaml
+# (precedence: room > building > these globals).
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +131,33 @@ def unknown_building_refs(buildings: list[dict], rooms: list[dict]) -> list[str]
         if b is not None and str(b) not in known:
             bad.append(str(r.get("space_id")))
     return bad
+
+
+def load_defaults(path) -> dict:
+    """Read defaults.yaml, filling any missing key with its built-in fallback so
+    the form always shows real numbers."""
+    data = {}
+    p = Path(path)
+    if p.exists() and p.stat().st_size:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    return {key: int(data.get(key, fb)) for key, _label, fb in DEFAULTS_FIELDS}
+
+
+def dump_defaults(values: dict) -> str:
+    """Serialize the global defaults back to YAML text with the header."""
+    payload = {key: int(values.get(key, fb)) for key, _label, fb in DEFAULTS_FIELDS}
+    body = yaml.safe_dump(payload, sort_keys=False, default_flow_style=False)
+    return DEFAULTS_HEADER + "\n" + body
+
+
+def save_defaults(path, values: dict) -> None:
+    """Write defaults.yaml, keeping a single .bak of the previous version."""
+    p = Path(path)
+    if p.exists():
+        backup = p.with_suffix(p.suffix + ".bak")
+        backup.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+    p.write_text(dump_defaults(values), encoding="utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,6 +248,8 @@ def run_gui(map_path: Path) -> int:
             self.path = path
             self.buildings: list[dict] = []
             self.rooms: list[dict] = []
+            self.defaults_path = DEFAULT_DEFAULTS_FILE
+            self.defaults = load_defaults(self.defaults_path)
             self.dirty = False
 
             self.title("25Live → Niagara — Room Mapping Editor")
@@ -224,6 +271,17 @@ def run_gui(map_path: Path) -> int:
             self._update_title()
 
         def _save(self) -> bool:
+            # Collect + validate the Defaults tab first (whole-number fields).
+            new_defaults = {}
+            for key, label, fb in DEFAULTS_FIELDS:
+                raw = self._defaults_vars[key].get().strip()
+                try:
+                    new_defaults[key] = int(raw) if raw != "" else fb
+                except ValueError:
+                    messagebox.showerror(
+                        "Defaults", f"'{label}' must be a whole number.")
+                    return False
+
             bad = unknown_building_refs(self.buildings, self.rooms)
             if bad and not messagebox.askyesno(
                     "Unknown building",
@@ -232,13 +290,16 @@ def run_gui(map_path: Path) -> int:
                 return False
             try:
                 save_mapping(self.path, self.buildings, self.rooms)
+                save_defaults(self.defaults_path, new_defaults)
             except Exception as exc:
                 messagebox.showerror("Save failed", str(exc))
                 return False
+            self.defaults = new_defaults
             self.dirty = False
             self._update_title()
-            messagebox.showinfo("Saved", f"Saved {len(self.rooms)} rooms and "
-                                f"{len(self.buildings)} buildings to\n{self.path}")
+            messagebox.showinfo(
+                "Saved", f"Saved {len(self.rooms)} rooms, {len(self.buildings)} "
+                f"buildings, and global defaults.")
             return True
 
         def _mark_dirty(self):
@@ -401,12 +462,33 @@ def run_gui(map_path: Path) -> int:
             nb.add(bld_tab, text="Buildings")
             self.bld_tree = self._make_table(
                 bld_tab,
-                columns=[("id", "ID", 160),
-                         ("name", "Name", 240),
-                         ("niagara_path", "Niagara Path", 240),
-                         ("space_id", "Bookable space_id", 140)],
+                columns=[("id", "ID", 140),
+                         ("name", "Name", 200),
+                         ("niagara_path", "Niagara Path", 210),
+                         ("pre_condition_minutes", "Pre", 45),
+                         ("post_buffer_minutes", "Post", 45),
+                         ("space_id", "Bookable space_id", 130)],
                 on_add=self._bld_add, on_edit=self._bld_edit,
                 on_delete=self._bld_delete)
+
+            # Defaults tab
+            def_tab = ttk.Frame(nb)
+            nb.add(def_tab, text="Defaults")
+            ttk.Label(
+                def_tab, wraplength=780, justify="left",
+                text="Global scheduling defaults. Rooms and buildings can override "
+                     "run-up/run-down in the other tabs (precedence: room > "
+                     "building > these globals). Saved to defaults.yaml."
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(12, 10))
+            self._defaults_vars = {}
+            for i, (key, label, fb) in enumerate(DEFAULTS_FIELDS, start=1):
+                ttk.Label(def_tab, text=label).grid(
+                    row=i, column=0, sticky="e", padx=10, pady=6)
+                var = tk.StringVar(value=str(self.defaults.get(key, fb)))
+                var.trace_add("write", lambda *a: self._mark_dirty())
+                self._defaults_vars[key] = var
+                ttk.Entry(def_tab, textvariable=var, width=12).grid(
+                    row=i, column=1, sticky="w", padx=10, pady=6)
 
         def _make_table(self, parent, columns, on_add, on_edit, on_delete):
             keys = [c[0] for c in columns]
@@ -444,7 +526,10 @@ def run_gui(map_path: Path) -> int:
             for i, b in enumerate(self.buildings):
                 self.bld_tree.insert("", "end", iid=str(i), values=(
                     b.get("id", ""), b.get("name", ""),
-                    b.get("niagara_path", ""), b.get("space_id", "")))
+                    b.get("niagara_path", ""),
+                    b.get("pre_condition_minutes", ""),
+                    b.get("post_buffer_minutes", ""),
+                    b.get("space_id", "")))
 
         @staticmethod
         def _selected_index(tree):
@@ -528,6 +613,8 @@ def run_gui(map_path: Path) -> int:
                 ("id", "Building ID *", "text", None),
                 ("name", "Name", "text", None),
                 ("niagara_path", "Niagara Path *", "text", None),
+                ("pre_condition_minutes", "Pre-condition minutes (rooms)", "int", None),
+                ("post_buffer_minutes", "Post-buffer minutes (rooms)", "int", None),
                 ("space_id", "Bookable 25Live space_id", "int", None),
             ]
 

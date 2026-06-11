@@ -1,6 +1,7 @@
 # Institution-specific config & data (copy the .example files and edit).
-# These hold each site's hosts, accounts, and room list — keep them local.
+# These hold each site's hosts, accounts, defaults, and room list — keep local.
 config.yaml
+defaults.yaml
 space_mapping.yaml
 
 # Python
