@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# 25Live -> Niagara Schedule Sync — Room/Building Mapping Editor
+# Copyright (C) 2026 Ryan Bibby and contributors
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. This program is distributed WITHOUT ANY WARRANTY; see the GNU General
+# Public License for more details <https://www.gnu.org/licenses/>.
 """
 Room / Building Mapping Editor  (GUI)
 =====================================

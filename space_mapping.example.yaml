@@ -1,6 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# space_mapping.yaml — 25Live  →  Niagara N4 schedule cross-reference
+# space_mapping.example.yaml — 25Live  →  Niagara schedule cross-reference
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Copy this to space_mapping.yaml (or just run editor.py, which creates it):
+#
+#   cp space_mapping.example.yaml space_mapping.yaml
+#
+# space_mapping.yaml is gitignored so your real room list stays local.
 #
 # Two sections:
 #   buildings:  each building's roll-up schedule, defined ONCE.
@@ -18,7 +24,7 @@
 #   id            (required)  short key that rooms reference (e.g. social_sciences)
 #   name          (optional)  label for logs
 #   niagara_path  (required)  the building roll-up schedule slot, RELATIVE to
-#                             CONFIG -> niagara -> schedule_base_path
+#                             niagara.schedule_base_path in config.yaml
 #                             (default slot:/Schedules)
 #   space_id      (optional)  ONLY if the building common area is itself bookable
 #                             in 25Live (e.g. an atrium); its own events then also

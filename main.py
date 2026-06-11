@@ -1,43 +1,48 @@
 #!/usr/bin/env python3
+# 25Live -> Niagara Schedule Sync
+# Copyright (C) 2026 Ryan Bibby and contributors
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details <https://www.gnu.org/licenses/>.
 """
-25Live -> Niagara N4 Schedule Sync  (daily cron edition)
-=========================================================
-Runs ONCE per invocation. Designed to be triggered on a schedule (2am daily):
+25Live -> Niagara Schedule Sync
+===============================
+Pulls room bookings from CollegeNET 25Live (Series25 WebServices, XML) and writes
+them into a Tridium Niagara station as BooleanSchedule SpecialEvents, so HVAC/
+lighting pre-conditions for booked rooms and stands down when they're empty.
 
-    Windows (Task Scheduler — this script runs on the Niagara 4.15 server, D:\\BAS):
-        Program:   python.exe
-        Arguments: D:\\BAS\\main.py
-        Start in:  D:\\BAS
-        Trigger:   Daily, 02:00
-
-    Linux/macOS (cron), if deployed off-host:
-        0 2 * * *  /usr/bin/python3 /opt/bas/main.py
+Runs ONCE per invocation — schedule it nightly (e.g. 2 AM) via Windows Task
+Scheduler or cron. See README.md for deployment details.
 
 On each run it:
-  1. Reads the space map from space_mapping.yaml
-  2. Pulls the next 7 days of confirmed events from the 25Live
-     Series25 WebServices API (XML)
+  1. Loads settings from config.yaml and the room map from space_mapping.yaml
+  2. Pulls the next N days of confirmed events from 25Live
   3. Applies per-space pre-conditioning / post-buffer offsets
   4. Merges overlapping/adjacent events into clean occupancy windows
   5. Rolls room events up into building-level schedules
-  6. Writes them to Niagara N4 as SpecialEvents at BACnet priority 14
+  6. Writes them to Niagara as BooleanSchedule SpecialEvents
   7. Writes a heartbeat timestamp to Niagara for monitoring
-  8. Exits 0 on success, non-zero on failure (so cron/monitoring can alert)
+  8. Exits 0 on success, non-zero on failure (so monitoring can alert)
 
 Quick start:
-    pip install -r requirements.txt          # requests, python-dateutil, PyYAML
-    set BAS_25LIVE_PASSWORD=...               # (export ... on Linux/macOS)
-    set BAS_NIAGARA_PASSWORD=...
-    python main.py --dry-run                  # fetch + build, no writes
+    pip install -r requirements.txt
+    cp config.example.yaml config.yaml         # then edit it for your site
+    export BAS_25LIVE_PASSWORD=...             # (set ... on Windows)
+    export BAS_NIAGARA_PASSWORD=...
+    python main.py --dry-run                    # fetch + build, no writes
 
-Files expected alongside this script:
-    space_mapping.yaml      (the 25Live space_id -> Niagara path cross-reference)
-
-Author: Facilities / BAS Integration
+Institution-specific settings live in config.yaml (gitignored). The room/building
+map lives in space_mapping.yaml (edit by hand or via editor.py).
 """
 
 import os
 import sys
+import copy
 import logging
 import argparse
 import xml.etree.ElementTree as ET
@@ -96,69 +101,104 @@ R25_NS = {"r25": "http://www.collegenet.com/r25"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  — edit these for your environment.
+# CONFIGURATION
 #
-# Secrets: leave passwords as PLACEHOLDER_PASSWORD here and set them via
-# environment variables instead (see load_credentials()):
-#     BAS_25LIVE_PASSWORD     -> collegenet.password
-#     BAS_NIAGARA_PASSWORD    -> niagara.password
+# Institution-specific settings live in config.yaml (copy config.example.yaml).
+# load_config() merges that file over these built-in DEFAULTS at startup, so the
+# code stays generic and each site only edits YAML. config.yaml is gitignored.
+#
+# Secrets are NOT stored in either file — set them as environment variables:
+#     BAS_25LIVE_PASSWORD   -> collegenet.password
+#     BAS_NIAGARA_PASSWORD  -> niagara.password
 # ─────────────────────────────────────────────────────────────────────────────
 
-CONFIG = {
-    # ── CollegeNet 25Live Series25 WebServices (XML API) ──
+# For CollegeNET-hosted 25Live, the WebServices base URL is built from the
+# instance name. Self-hosted sites set collegenet.base_url directly instead.
+COLLEGENET_URL_TEMPLATE = "https://webservices.collegenet.com/r25ws/wrd/{instance}/run"
+
+DEFAULTS = {
+    # ── CollegeNET 25Live Series25 WebServices (XML API) ──
     "collegenet": {
-        # Kennesaw is CollegeNet-hosted, so the base URL is:
-        "base_url": "https://webservices.collegenet.com/r25ws/wrd/kennesaw/run",
-        "username": "svc-bas-scheduler",      # local 25Live account (not SSO)
+        "instance": "",                       # your 25Live instance name
+        "base_url": "",                       # blank -> built from `instance`
+        "username": "",                       # a LOCAL 25Live account (not SSO)
         "password": PLACEHOLDER_PASSWORD,     # set env var BAS_25LIVE_PASSWORD
-        "lookahead_days": 7,                  # pull the next 7 days
-        "include_states": [2],                # event states to sync: 2=confirmed
-                                              #   (add 4 for tentative)
-        "default_pre_condition_minutes": 30,  # fallback if space has no override
-        "default_post_buffer_minutes": 15,    # fallback if space has no override
+        "lookahead_days": 7,
+        "include_states": [2],                # 2=confirmed (add 4 for tentative)
+        "default_pre_condition_minutes": 30,
+        "default_post_buffer_minutes": 15,
         "merge_gap_minutes": 5,               # default gap for collapsing a
-                                              #   space's windows; a room/building
-                                              #   may override per entry. Merges
-                                              #   ACROSS rooms (building roll-ups)
-                                              #   use this default.
+                                              #   space's windows; rooms/buildings
+                                              #   may override per entry. Building
+                                              #   roll-ups use this default.
     },
 
-    # ── Niagara N4 station (REST/HTTP API) ──
+    # ── Niagara station (REST/HTTP API) ──
     "niagara": {
-        "host": "niagaraprdweb01.win.kennesaw.edu",  # same VM as script; cert matches this FQDN. Fallbacks: 10.54.40.79 / localhost
-        "port": 443,                          # CONFIRM — may be 8443
+        "host": "localhost",                  # station host (localhost if this
+                                              #   runs on the station server)
+        "port": 443,                          # confirm — often 443 or 8443
         "https": True,
-        "username": "svc-scheduler",          # local Niagara operator account
+        "username": "",
         "password": PLACEHOLDER_PASSWORD,     # set env var BAS_NIAGARA_PASSWORD
-        "verify_tls": False,                  # set True + provide CA bundle in prod
+        "verify_tls": False,                  # or a CA-bundle path in production
         "schedule_base_path": "slot:/Schedules",
-        "heartbeat_path": "slot:/Schedules/_LastSync",  # for monitoring
+        "heartbeat_path": "slot:/Schedules/_LastSync",
     },
 
-    "timezone": "America/New_York",
+    "timezone": "America/New_York",           # your campus timezone (IANA name)
 
-    # Path to the space map YAML (same folder as this script by default).
+    # Room map YAML (same folder as this script by default).
     "space_map_file": str(Path(__file__).parent / "space_mapping.yaml"),
 
-    # Log file. Defaults are OS-aware (see default_log_file); override here if
-    # you want a specific location.
-    "log_file": None,   # None -> default_log_file() picks a sensible path
+    # Log file. None -> default_log_file(); override in config.yaml if desired.
+    "log_file": None,
 }
+
+# Working config: DEFAULTS until main() merges config.yaml over a copy of it.
+# Importers and tests can use this directly (it holds the defaults).
+CONFIG = copy.deepcopy(DEFAULTS)
 
 
 def default_log_file() -> str:
     """
-    Pick a sensible log path for the host OS:
-      Windows -> D:\\BAS\\logs\\25live_sync.log   (deployed alongside the script)
-      else    -> /var/log/bas/25live_sync.log
-    setup_logging() falls back to stdout-only if the directory isn't writable,
-    so this never blocks a run.
+    Default log path: a logs/ folder next to this script (portable across OSes).
+    Override with `log_file` in config.yaml. setup_logging() falls back to
+    stdout-only if the directory isn't writable, so this never blocks a run.
     """
-    if os.name == "nt":
-        base = Path(r"D:\BAS\logs")
-    else:
-        base = Path("/var/log/bas")
-    return str(base / "25live_sync.log")
+    return str(Path(__file__).parent / "logs" / "25live_sync.log")
+
+
+def _deep_merge(base: dict, override: dict) -> None:
+    """Recursively merge `override` into `base` in place (nested dicts merged,
+    scalars/lists replaced)."""
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], val)
+        else:
+            base[key] = val
+
+
+def load_config(path: str) -> dict:
+    """
+    Build the runtime config: a deep copy of DEFAULTS with config.yaml merged
+    over it. A missing file just yields the defaults (main() warns about it).
+    If collegenet.base_url is blank, it's derived from collegenet.instance.
+    Secrets are applied separately by load_credentials().
+    """
+    cfg = copy.deepcopy(DEFAULTS)
+    p = Path(path)
+    if p.exists():
+        with open(p, "r", encoding="utf-8") as fh:
+            user = yaml.safe_load(fh) or {}
+        _deep_merge(cfg, user)
+
+    cn = cfg["collegenet"]
+    if not cn.get("base_url"):
+        instance = (cn.get("instance") or "").strip()
+        if instance:
+            cn["base_url"] = COLLEGENET_URL_TEMPLATE.format(instance=instance)
+    return cfg
 
 
 def load_credentials(config: dict) -> None:
@@ -271,7 +311,13 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
     default_post = cfg["collegenet"]["default_post_buffer_minutes"]
     default_gap = cfg["collegenet"]["merge_gap_minutes"]
 
-    with open(path, "r") as fh:
+    if not Path(path).exists():
+        logging.error(
+            "Room map not found: %s — copy space_mapping.example.yaml to "
+            "space_mapping.yaml (or run editor.py) and add your rooms.", path)
+        return {}
+
+    with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
 
     # 1) Index the building definitions by their id.
@@ -715,6 +761,13 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
         logging.error("Space map is empty — nothing to sync. Aborting.")
         return 2
 
+    if not cfg["collegenet"].get("base_url"):
+        logging.error(
+            "25Live base_url is not set — set collegenet.instance (for "
+            "CollegeNET-hosted sites) or collegenet.base_url in config.yaml. "
+            "Did you copy config.example.yaml to config.yaml?")
+        return 4
+
     cn = CollegeNetClient(cfg["collegenet"], tz)
     builder = ScheduleBuilder(cfg["collegenet"]["merge_gap_minutes"])
 
@@ -786,25 +839,36 @@ def setup_logging(log_file: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="25Live -> Niagara N4 daily schedule sync (single run).")
+        description="25Live -> Niagara schedule sync (single run).")
+    parser.add_argument("--config",
+                        help="Path to config.yaml (default: ./config.yaml, or $BAS_CONFIG)")
     parser.add_argument("--space-map", help="Override path to space_mapping.yaml")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and build schedules but do not write to Niagara")
     args = parser.parse_args()
 
-    if args.space_map:
-        CONFIG["space_map_file"] = args.space_map
-    if CONFIG["log_file"] is None:
-        CONFIG["log_file"] = default_log_file()
+    cfg_path = (args.config or os.environ.get("BAS_CONFIG")
+                or str(Path(__file__).parent / "config.yaml"))
+    cfg = load_config(cfg_path)
 
-    setup_logging(CONFIG["log_file"])
-    load_credentials(CONFIG)   # after logging is up, so warnings are captured
+    if args.space_map:
+        cfg["space_map_file"] = args.space_map
+    if cfg["log_file"] is None:
+        cfg["log_file"] = default_log_file()
+
+    setup_logging(cfg["log_file"])
+    if not Path(cfg_path).exists():
+        logging.warning(
+            "No config file at %s — using built-in defaults. Copy "
+            "config.example.yaml to config.yaml and edit it for your site.",
+            cfg_path)
+    load_credentials(cfg)   # after logging is up, so warnings are captured
 
     logging.info("=== 25Live -> Niagara sync starting (lookahead %d days%s) ===",
-                 CONFIG["collegenet"]["lookahead_days"],
+                 cfg["collegenet"]["lookahead_days"],
                  ", DRY RUN" if args.dry_run else "")
 
-    code = run_sync(CONFIG, dry_run=args.dry_run)
+    code = run_sync(cfg, dry_run=args.dry_run)
     logging.info("=== Sync exited with code %d ===", code)
     return code
 
