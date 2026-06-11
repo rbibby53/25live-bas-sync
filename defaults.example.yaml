@@ -1,0 +1,16 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# defaults.example.yaml — global scheduling defaults (easily adjustable)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Copy to defaults.yaml:   cp defaults.example.yaml defaults.yaml
+# Edit by hand, or use the "Defaults" tab in editor.py.
+#
+# These are FALLBACK values. Individual rooms — and whole buildings — can
+# override run-up/run-down in space_mapping.yaml. Precedence is:
+#     room override  >  building override  >  these global defaults
+# ─────────────────────────────────────────────────────────────────────────────
+
+pre_condition_minutes: 30   # HVAC run-up (lead time) BEFORE a booking
+post_buffer_minutes: 15     # HVAC run-down (hold) AFTER a booking
+merge_gap_minutes: 5        # collapse back-to-back windows within this many minutes
+lookahead_days: 7           # how many days ahead to pull events

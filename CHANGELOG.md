@@ -7,6 +7,13 @@ semantic versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Added
+- **`defaults.yaml`** — global scheduling defaults (run-up, run-down, merge-gap,
+  lookahead) split into their own operator-tunable file, with a **Defaults** tab
+  in the editor and a `--defaults` flag. Connection/auth settings stay in
+  `config.yaml`.
+- **Per-building run-up/run-down override.** A building may set
+  `pre_condition_minutes`/`post_buffer_minutes` that its rooms inherit;
+  precedence is room > building > global default.
 - **Retry with backoff** for transient 25Live/Niagara errors (timeouts, 429,
   5xx). Applied to reads and the idempotent clear; POST writes are not
   auto-retried, to avoid duplicate special events. Configurable via `retry:`.

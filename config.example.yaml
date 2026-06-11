@@ -22,13 +22,9 @@ collegenet:
   base_url: ""
 
   username: "svc-25live"        # a LOCAL 25Live account (NOT SSO) with read access
-  lookahead_days: 7             # how many days ahead to sync
   include_states: [2]           # event states to sync: 2=confirmed (add 4 for tentative)
-
-  # Defaults applied to any room that doesn't override them (minutes):
-  default_pre_condition_minutes: 30   # start HVAC this long before an event
-  default_post_buffer_minutes: 15     # hold occupancy this long after an event
-  merge_gap_minutes: 5                # collapse windows within this gap
+  # Scheduling defaults (run-up / run-down / merge-gap / lookahead) live in
+  # defaults.yaml — see defaults.example.yaml.
 
 niagara:
   host: "localhost"             # station host; localhost if this runs on the station

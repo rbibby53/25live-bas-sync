@@ -83,7 +83,19 @@ $env:BAS_25LIVE_PASSWORD  = "..."
 $env:BAS_NIAGARA_PASSWORD = "..."
 ```
 
-**3. Room map** — copy the example, then edit by hand or with the GUI:
+**3. Scheduling defaults** — copy the example:
+
+```bash
+cp defaults.example.yaml defaults.yaml
+```
+
+`defaults.yaml` holds the global run-up/run-down/merge-gap/lookahead defaults — the
+operator-tunable knobs, kept separate from the IT-managed connection settings. Edit
+it by hand or in the editor's **Defaults** tab. Rooms and buildings can override
+run-up/run-down (precedence **room > building > these globals**). Override the path
+with `--defaults PATH` or `$BAS_DEFAULTS`.
+
+**4. Room map** — copy the example, then edit by hand or with the GUI:
 
 ```bash
 cp space_mapping.example.yaml space_mapping.yaml
@@ -99,6 +111,10 @@ building's Niagara path on a room, so you can't forget to wire one up. Omit
 itself bookable in 25Live (e.g. an atrium), give the building a `space_id:` and its
 own events count too. `space_mapping.example.yaml` documents every field.
 
+Run-up (`pre_condition_minutes`) and run-down (`post_buffer_minutes`) resolve with
+precedence **room > building > global** — set a building-wide default that all its
+rooms inherit, and override it on individual rooms as needed.
+
 ### Editing rooms with the GUI
 
 Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
@@ -107,6 +123,8 @@ Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
   your defined buildings, so a room joins its roll-up just by picking it.
 - **Buildings** tab — manage roll-up schedules; renaming a building id repoints the
   rooms that referenced it.
+- **Defaults** tab — adjust the global run-up/run-down/merge-gap/lookahead values
+  (saved to `defaults.yaml`).
 - **Tools** menu — *Test 25Live connection*, *Test Niagara connection*, and
   *Preview (dry run)* run against your `config.yaml` without leaving the editor.
 
@@ -234,7 +252,8 @@ against your own 25Live instance and Niagara station.
 | `main.py`                    | The sync script.                                    |
 | `editor.py`                  | GUI to add/edit rooms & buildings (Tkinter).        |
 | `Edit-Rooms.bat`             | Double-click launcher for the editor (Windows).     |
-| `config.example.yaml`        | Settings template → copy to `config.yaml`.          |
+| `config.example.yaml`        | Connection/settings template → copy to `config.yaml`.|
+| `defaults.example.yaml`      | Scheduling defaults → copy to `defaults.yaml`.      |
 | `space_mapping.example.yaml` | Room map template → copy to `space_mapping.yaml`.   |
 | `requirements.txt`           | Python dependencies.                                |
 | `Test.py`                    | Offline tests for the merge logic + editor I/O.     |

@@ -223,6 +223,44 @@ def test_naive_25live_datetime_uses_configured_tz():
     assert d.utcoffset() is not None
 
 
+def test_building_runup_overrides_global_but_not_room():
+    """Run-up/run-down precedence: room override > building override > global."""
+    yaml_text = """
+buildings:
+  - id: b
+    niagara_path: "B/Bldg"
+    pre_condition_minutes: 50
+    post_buffer_minutes: 20
+spaces:
+  - space_id: 1
+    building: b
+    niagara_path: "B/Rm1"
+  - space_id: 2
+    building: b
+    niagara_path: "B/Rm2"
+    pre_condition_minutes: 5
+  - space_id: 3
+    niagara_path: "B/Rm3"
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        sm = load_space_map(path, CONFIG)
+    finally:
+        os.unlink(path)
+
+    # Room 1: no overrides -> inherits the BUILDING values (not global).
+    assert sm["1"].pre_condition_minutes == 50, sm["1"].pre_condition_minutes
+    assert sm["1"].post_buffer_minutes == 20, sm["1"].post_buffer_minutes
+    # Room 2: sets pre (beats building); post falls back to the building value.
+    assert sm["2"].pre_condition_minutes == 5, sm["2"].pre_condition_minutes
+    assert sm["2"].post_buffer_minutes == 20, sm["2"].post_buffer_minutes
+    # Room 3: no building -> GLOBAL defaults.
+    assert sm["3"].pre_condition_minutes == CONFIG["collegenet"]["default_pre_condition_minutes"]
+    assert sm["3"].post_buffer_minutes == CONFIG["collegenet"]["default_post_buffer_minutes"]
+
+
 def test_overlap_helper():
     """Sanity-check the OccupancyWindow overlap primitive directly."""
     a = OccupancyWindow(dt(9), dt(10))
@@ -390,6 +428,51 @@ def test_send_alert_webhook_and_disabled():
         assert captured == {}, "disabled alerts must not post"
     finally:
         main.requests.post = original
+
+
+def test_load_config_reads_defaults_file():
+    """defaults.yaml overrides the built-in scheduling defaults and maps onto
+    the internal config keys."""
+    import main
+    cfg_text = "collegenet:\n  instance: demo\n"
+    def_text = ("pre_condition_minutes: 45\npost_buffer_minutes: 25\n"
+                "merge_gap_minutes: 8\nlookahead_days: 14\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f1:
+        f1.write(cfg_text)
+        cpath = f1.name
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f2:
+        f2.write(def_text)
+        dpath = f2.name
+    try:
+        cfg = main.load_config(cpath, dpath)
+    finally:
+        os.unlink(cpath)
+        os.unlink(dpath)
+    cn = cfg["collegenet"]
+    assert cn["default_pre_condition_minutes"] == 45, cn
+    assert cn["default_post_buffer_minutes"] == 25, cn
+    assert cn["merge_gap_minutes"] == 8, cn
+    assert cn["lookahead_days"] == 14, cn
+
+
+def test_editor_defaults_roundtrip_and_fallback():
+    """dump_defaults -> load_defaults round-trips; a missing file yields the
+    built-in fallbacks (so the GUI always shows real numbers)."""
+    import editor
+    text = editor.dump_defaults({"pre_condition_minutes": 40,
+                                 "post_buffer_minutes": 10,
+                                 "merge_gap_minutes": 3, "lookahead_days": 21})
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(text)
+        path = fh.name
+    try:
+        d = editor.load_defaults(path)
+    finally:
+        os.unlink(path)
+    assert d == {"pre_condition_minutes": 40, "post_buffer_minutes": 10,
+                 "merge_gap_minutes": 3, "lookahead_days": 21}, d
+    d2 = editor.load_defaults("/nonexistent/defaults.yaml")
+    assert d2["pre_condition_minutes"] == 30 and d2["lookahead_days"] == 7, d2
 
 
 def main() -> int:
