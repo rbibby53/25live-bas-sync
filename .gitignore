@@ -1,0 +1,21 @@
+# Institution-specific config & data (copy the .example files and edit).
+# These hold each site's hosts, accounts, and room list — keep them local.
+config.yaml
+space_mapping.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor backups written by editor.py on save
+*.bak
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

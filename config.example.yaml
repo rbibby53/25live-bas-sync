@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# config.example.yaml — copy this to config.yaml and edit for YOUR institution.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   cp config.example.yaml config.yaml
+#
+# config.yaml is gitignored, so your site's settings stay out of version control.
+# Anything you omit here falls back to the built-in defaults in main.py.
+#
+# SECRETS ARE NOT STORED HERE. Set the two passwords as environment variables:
+#   BAS_25LIVE_PASSWORD     (the 25Live service-account password)
+#   BAS_NIAGARA_PASSWORD    (the Niagara service-account password)
+# ─────────────────────────────────────────────────────────────────────────────
+
+collegenet:
+  # Your Series25/25Live instance name. For CollegeNET-hosted sites the
+  # WebServices base URL is built automatically as:
+  #   https://webservices.collegenet.com/r25ws/wrd/<instance>/run
+  instance: "your-instance"
+
+  # Self-hosted Series25? Set base_url explicitly and leave instance blank.
+  base_url: ""
+
+  username: "svc-25live"        # a LOCAL 25Live account (NOT SSO) with read access
+  lookahead_days: 7             # how many days ahead to sync
+  include_states: [2]           # event states to sync: 2=confirmed (add 4 for tentative)
+
+  # Defaults applied to any room that doesn't override them (minutes):
+  default_pre_condition_minutes: 30   # start HVAC this long before an event
+  default_post_buffer_minutes: 15     # hold occupancy this long after an event
+  merge_gap_minutes: 5                # collapse windows within this gap
+
+niagara:
+  host: "localhost"             # station host; localhost if this runs on the station
+  port: 443                     # confirm for your station — often 443 or 8443
+  https: true
+  username: "svc-scheduler"     # a Niagara operator account
+  verify_tls: false             # false for a self-signed cert; else a CA-bundle path
+  schedule_base_path: "slot:/Schedules"          # where your BooleanSchedules live
+  heartbeat_path: "slot:/Schedules/_LastSync"    # a point stamped each run (or "" to disable)
+
+# Your campus timezone as an IANA name (e.g. America/New_York, America/Chicago,
+# America/Denver, America/Los_Angeles).
+timezone: "America/New_York"
+
+# Optional overrides (sensible defaults are used if omitted):
+# space_map_file: "space_mapping.yaml"
+# log_file: "logs/25live_sync.log"

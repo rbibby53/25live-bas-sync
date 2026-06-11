@@ -186,6 +186,43 @@ spaces:
     assert space_map["2"].merge_gap_minutes == CONFIG["collegenet"]["merge_gap_minutes"]
 
 
+def test_loader_preserves_explicit_zero_buffers():
+    """An explicit 0 for pre/post/merge_gap must be honored, not replaced by the
+    default (regression for the `value or default` coalescing bug)."""
+    yaml_text = """
+buildings: []
+spaces:
+  - space_id: 1
+    niagara_path: "B/Rm1"
+    pre_condition_minutes: 0
+    post_buffer_minutes: 0
+    merge_gap_minutes: 0
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        space_map = load_space_map(path, CONFIG)
+    finally:
+        os.unlink(path)
+    s = space_map["1"]
+    assert s.pre_condition_minutes == 0, s.pre_condition_minutes
+    assert s.post_buffer_minutes == 0, s.post_buffer_minutes
+    assert s.merge_gap_minutes == 0, s.merge_gap_minutes
+
+
+def test_naive_25live_datetime_uses_configured_tz():
+    """A naive 25Live timestamp is interpreted in the configured timezone, not
+    the server's local tz (regression for .astimezone() on a naive datetime)."""
+    import main
+    cn = main.CollegeNetClient(main.CONFIG["collegenet"], TZ)
+    d = cn._to_tz("2026-06-10T09:00:00")   # naive (no offset)
+    assert d.tzinfo is not None
+    # 09:00 is treated as 09:00 Eastern — wall-clock preserved, tz attached.
+    assert (d.hour, d.minute) == (9, 0), d
+    assert d.utcoffset() is not None
+
+
 def test_overlap_helper():
     """Sanity-check the OccupancyWindow overlap primitive directly."""
     a = OccupancyWindow(dt(9), dt(10))
@@ -263,6 +300,40 @@ def test_editor_flags_unknown_building():
     buildings = [{"id": "bldg_a", "niagara_path": "A/Building_Occ"}]
     rooms = [{"space_id": 11, "building": "typo_bldg", "niagara_path": "A/Rm.Occ"}]
     assert editor.unknown_building_refs(buildings, rooms) == ["11"]
+
+
+def test_load_config_merges_and_builds_base_url():
+    """load_config deep-merges config.yaml over DEFAULTS, derives base_url from
+    the instance, and falls back to defaults when the file is missing."""
+    import main
+    yaml_text = """
+collegenet:
+  instance: demo-univ
+  lookahead_days: 14
+niagara:
+  host: niagara.example.edu
+  port: 8443
+timezone: America/Chicago
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        cfg = main.load_config(path)
+    finally:
+        os.unlink(path)
+
+    assert cfg["collegenet"]["lookahead_days"] == 14
+    assert cfg["niagara"]["host"] == "niagara.example.edu"
+    assert cfg["niagara"]["port"] == 8443
+    assert cfg["timezone"] == "America/Chicago"
+    # Deep merge preserves untouched defaults rather than replacing the section.
+    assert cfg["collegenet"]["merge_gap_minutes"] == 5
+    # base_url derived from the instance name.
+    assert cfg["collegenet"]["base_url"].endswith("/demo-univ/run")
+    # Missing file -> pure defaults, no crash.
+    cfg2 = main.load_config("/nonexistent/path/config.yaml")
+    assert cfg2["collegenet"]["lookahead_days"] == 7
 
 
 def main() -> int:

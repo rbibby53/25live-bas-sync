@@ -1,156 +1,218 @@
-# 25Live → Niagara N4 Schedule Sync
+# 25Live → Niagara Schedule Sync
 
-A single-run script (designed for a daily 2 AM schedule) that pulls confirmed
-events from CollegeNET **25Live** and writes them into a **Niagara N4** station as
-BACnet `SpecialEvents` at priority 14, so HVAC/lighting pre-conditions for booked
-rooms and stands down when they're empty.
+Drive your building automation occupancy from your room bookings. This tool pulls
+confirmed events from **CollegeNET 25Live** (Series25 WebServices) and writes them
+into a **Tridium Niagara** station as `BooleanSchedule` **SpecialEvents**, so HVAC
+and lighting pre-condition for booked rooms and stand down when they're empty.
+
+It's a single-run script meant to be scheduled nightly. It's read-only against
+25Live and only writes occupancy schedules to Niagara.
+
+> Built for one campus and generalized for others. **Two things are
+> instance-specific and must be confirmed before your first live write:** the
+> 25Live `state` request parameter and the Niagara REST contract (base path,
+> SpecialEvent JSON, ORD style). Both are flagged in code and discussed below.
+
+## Features
+
+- Pulls the next *N* days of confirmed events for a configured set of spaces.
+- Per-room **pre-conditioning** and **post-event** buffers (with global defaults).
+- Merges overlapping/adjacent bookings into clean occupancy windows.
+- **Building roll-up**: every room in a building automatically unions into that
+  building's schedule — if *any* room is occupied, common areas run too.
+- A small **Tkinter GUI** (`editor.py`) so non-developers can manage the room map.
+- `--dry-run` mode, structured logging, a monitoring heartbeat, and exit codes for
+  alerting.
 
 ## How it works
 
 ```
-25Live events.xml ──► parse + apply pre/post buffers ──► merge into occupancy
-windows ──► roll rooms up into building schedules ──► write to Niagara N4 ──► heartbeat
+25Live events  ──►  parse + apply pre/post buffers  ──►  merge into occupancy
+windows  ──►  roll rooms up into building schedules  ──►  write to Niagara  ──►  heartbeat
 ```
 
-Everything lives in **`main.py`**. The only file you normally edit to change *what*
-gets synced is **`space_mapping.yaml`**.
+The Python (`main.py`) stays generic. Everything site-specific lives in two YAML
+files you create from the provided examples.
 
-### Building occupancy = union of all its rooms
+## Requirements
 
-`space_mapping.yaml` has a `buildings:` section (each building defined once) and a
-`spaces:` section (the rooms). Each room names the building it belongs to with a
-`building:` id. **Every room in a building is automatically rolled up into that
-building's schedule** — if *any* room is occupied, the building schedule (hallways,
-lobbies, common AHUs) runs HVAC too. You never repeat the building's Niagara path on
-a room, so you can't forget to wire one up. Omit `building:` on a room that should
-run on its own only. If a building's common area is itself bookable in 25Live (e.g.
-an atrium), give the building a `space_id:` and its own events count too.
+- **Python 3.9+** (uses `zoneinfo` and `list[...]`/`dict[...]` type hints).
+- A **local 25Live account** (not SSO) with read access to your events/locations,
+  and Series25 WebServices enabled.
+- A **Niagara station** with `BooleanSchedule` components and a reachable web/REST
+  service (see *Niagara setup*).
 
-## Setup
+## Install
 
 ```bash
+git clone https://github.com/rbibby53/25Live_Niagara_Sync.git
+cd 25Live_Niagara_Sync
 pip install -r requirements.txt
 ```
 
-Set the two passwords as environment variables (never commit them):
+> **Windows:** `requirements.txt` includes `tzdata` on purpose — Windows has no
+> system timezone database, so without it `ZoneInfo(...)` raises
+> `ZoneInfoNotFoundError` and the sync won't start. Install the dependencies for
+> the **same** `python` that the scheduled task and `Edit-Rooms.bat` invoke.
+
+## Configure
+
+**1. Settings** — copy the example and edit it for your institution:
 
 ```bash
-# Windows (PowerShell)
-$env:BAS_25LIVE_PASSWORD  = "..."
-$env:BAS_NIAGARA_PASSWORD = "..."
+cp config.example.yaml config.yaml
+```
 
+`config.yaml` holds your 25Live instance, Niagara host, accounts, timezone, and
+schedule paths. It's **gitignored** so your settings never get committed. Anything
+you omit falls back to the defaults in `main.py`. You can point at a different file
+with `--config PATH` or the `BAS_CONFIG` environment variable.
+
+**2. Secrets** — passwords are **never** stored in files; set them as environment
+variables:
+
+```bash
 # Linux / macOS
 export BAS_25LIVE_PASSWORD=...
 export BAS_NIAGARA_PASSWORD=...
+
+# Windows (PowerShell)
+$env:BAS_25LIVE_PASSWORD  = "..."
+$env:BAS_NIAGARA_PASSWORD = "..."
 ```
 
-Then edit the `CONFIG` block at the top of `main.py` for your environment
-(hosts, usernames, timezone) and fill in `space_mapping.yaml`.
+**3. Room map** — copy the example, then edit by hand or with the GUI:
 
-## Editing rooms (GUI)
+```bash
+cp space_mapping.example.yaml space_mapping.yaml
+```
 
-You don't have to hand-edit YAML. **Double-click `Edit-Rooms.bat`** (or run
-`python editor.py`) to open the Room Mapping Editor:
+### The room map (`space_mapping.yaml`)
 
-- **Rooms** tab — Add / Edit / Delete rooms. The **Building** field is a dropdown
-  of your defined buildings, so a room joins its building's roll-up just by
-  picking it. Double-click a row to edit.
-- **Buildings** tab — manage the building roll-up schedules. Renaming a building
-  id automatically repoints the rooms that referenced it.
+Two sections: `buildings:` (each roll-up schedule, defined once) and `spaces:`
+(the rooms). Each room names its `building:` by id, and **every room in a building
+is automatically unioned into that building's schedule** — you never repeat the
+building's Niagara path on a room, so you can't forget to wire one up. Omit
+`building:` on a room that should run standalone. If a building's common area is
+itself bookable in 25Live (e.g. an atrium), give the building a `space_id:` and its
+own events count too. `space_mapping.example.yaml` documents every field.
 
-It edits the same `space_mapping.yaml` the nightly sync reads, validates required
-fields and duplicate IDs, warns if a room points at a missing building, and keeps
-a `space_mapping.yaml.bak` of the previous version on every save.
+### Editing rooms with the GUI
 
-> Note: saving from the editor rewrites the file and **does not preserve inline
-> `#` comments** — it regenerates a clean header instead. To keep a per-room note
-> through edits, use the **Note** field (saved as a `note:` key the sync ignores).
+Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
+
+- **Rooms** tab — Add/Edit/Delete rooms; the **Building** field is a dropdown of
+  your defined buildings, so a room joins its roll-up just by picking it.
+- **Buildings** tab — manage roll-up schedules; renaming a building id repoints the
+  rooms that referenced it.
+
+It validates required fields and duplicate IDs, warns on missing-building
+references, and keeps a `.bak` of the previous version on save.
+
+> Saving from the editor rewrites the file and **does not preserve inline `#`
+> comments** — it regenerates a clean header. To keep a per-room note through
+> edits, use the **Note** field (stored as a `note:` key the sync ignores).
 
 ## Running
 
 ```bash
-# Safe: fetch from 25Live and print what WOULD be written — no Niagara writes.
-python main.py --dry-run
-
-# Live run (writes to Niagara).
-python main.py
-
-# Point at a different map file.
-python main.py --space-map /path/to/space_mapping.yaml
+python main.py --dry-run     # fetch + build, print what WOULD be written (no writes)
+python main.py               # live run (writes to Niagara)
+python main.py --config /etc/25live/config.yaml --space-map /etc/25live/rooms.yaml
 ```
 
-Exit codes (for monitoring): `0` ok · `2` empty map · `3` Niagara unreachable ·
-`4` 25Live fetch failed · `5` one or more write failures.
+Exit codes (for monitoring): `0` ok · `2` empty/missing room map · `3` Niagara
+unreachable · `4` 25Live fetch failed · `5` one or more write failures.
 
 ## Scheduling
 
-This runs on the **Niagara 4.15 server itself**, deployed in `D:\BAS`.
+Run it once per night. It's typically deployed **on the Niagara station server**
+itself, but it can run anywhere that can reach both 25Live and the station.
 
 **Windows Task Scheduler:**
 - Program: `python.exe`
-- Arguments: `D:\BAS\main.py`
-- Start in: `D:\BAS`
-- Trigger: Daily, 02:00
-- Set the two `BAS_*_PASSWORD` env vars for the service account that runs the task.
+- Arguments: `<install-dir>\main.py`
+- Start in: `<install-dir>`
+- Trigger: Daily, e.g. 02:00
+- Set the two `BAS_*_PASSWORD` env vars for the account that runs the task.
 
-**Linux/macOS cron (if ever deployed off-host):**
+**Linux/macOS cron:**
 ```
-0 2 * * *  /usr/bin/python3 /opt/bas/main.py
+0 2 * * *  /usr/bin/python3 /opt/25live-niagara-sync/main.py
 ```
 
-Logs go to `D:\BAS\logs\25live_sync.log` on Windows (or `/var/log/bas/` on
-Linux/macOS); override via `CONFIG["log_file"]`. If that directory isn't writable
-the script logs to stdout instead.
+Logs default to `logs/25live_sync.log` next to the script (override with
+`log_file` in `config.yaml`); if that directory isn't writable the script logs to
+stdout instead.
 
-### Niagara 4.15 REST surface — confirm before the first live write
+## Niagara setup
 
-The write side targets N4.15 but its exact REST contract depends on the station's
-web service. Three knobs are gathered so they're a one-line change if your station
-differs (each is flagged in `NiagaraClient`):
-- `NIAGARA_REST_BASE` (default `/rest/v1`) — the REST base path,
-- the `SpecialEvent` JSON in `_write_special_event`,
-- the schedule slot ORD style (`slot:/Schedules/...`).
+This populates the *calendar* of a schedule; you still wire the schedule into your
+equipment once in Workbench:
 
-Confirm these against the station's REST docs / Workbench `rest` service. `--dry-run`
-never touches Niagara, so use it to validate the 25Live side first.
+1. Create a `BooleanSchedule` at each ORD in your map (the room ones **and** the
+   building roll-up ones), under `niagara.schedule_base_path` (default
+   `slot:/Schedules`).
+2. Set the schedule's normal weekly default to **Unoccupied** (the sync only writes
+   the booking *special events*).
+3. Link each schedule's `out` into your occupancy logic (room → that zone; building
+   → common AHUs/hallways).
 
-## Changes from the original review
+**Confirm the REST contract for your station/version.** The write path
+(`NiagaraClient`) assumes a REST surface — these three knobs are isolated so
+adapting is a small change: `NIAGARA_REST_BASE` (default `/rest/v1`), the
+`SpecialEvent` JSON in `_write_special_event`, and the `slot:/...` ORD style. If
+your station exposes schedules via oBIX or BACnet instead, swap the write layer.
+`--dry-run` never touches Niagara, so validate the 25Live side independently first.
 
-This version is a readability/maintainability refactor of the original script with
-a few **conservative correctness fixes** — the core sync semantics (merge logic,
-priority-14 writes, clear-then-write idempotency, heartbeat) are unchanged.
+## 25Live setup
 
-Maintainability:
-- Magic values gathered into named constants at the top
-  (`BACNET_SCHEDULE_PRIORITY`, `PAGE_SIZE`, timeouts, etc.).
-- Secret loading centralized in `load_credentials()`, which now **warns** if a
-  password is still the `CHANGE_ME` placeholder.
-- `--dry-run` no longer duplicates fetch/build logic — it's one path inside
-  `run_sync(dry_run=...)`, so the two modes can't drift.
-- Consistent type hints; `import os` moved to the top.
+- Create a **local** service account (not SSO) with read access to the relevant
+  events and locations, and enable Series25 WebServices for it.
+- Set `collegenet.instance` in `config.yaml` (CollegeNET-hosted), or set
+  `collegenet.base_url` directly if self-hosted.
+- The request filters confirmed events by the numeric `state` param derived from
+  `include_states`. **Confirm the exact format for your instance** — it's flagged in
+  `CollegeNetClient._fetch_batch` and is a one-line change if yours differs.
+- Find a space's numeric `space_id` from its detail-page URL in 25Live, or via your
+  Series25 admin tools.
 
-Correctness fixes (each called out in code comments):
-1. **25Live state filter** — the request now sends the numeric `state` query
-   param (derived from `include_states`) instead of `include=confirmed`, so
-   `CONFIG` actually drives the request. ⚠️ Verify the exact param format against
-   your Kennesaw Series25 WebServices docs — it's flagged with a comment in
-   `CollegeNetClient._fetch_batch` and is a one-line change if your instance
-   differs.
-2. **Log path / schedule mismatch** — log path is now OS-aware (Windows vs
-   Linux) instead of a hard-coded `C:\` path, and the docstring shows both
-   Windows Task Scheduler and cron.
-3. **TLS verification** — `verify_tls=False` now logs an explicit warning so it's
-   never silently off; documented how to point it at a CA bundle for production.
-4. **URL length** — space IDs are requested in batches of
-   `SPACE_IDS_PER_REQUEST` (50) so a large map can't blow the query-string limit.
+## Tests
+
+Offline tests (no 25Live/Niagara needed) cover the merge/roll-up logic, the loader,
+and the editor's YAML round-trip:
+
+```bash
+python Test.py
+```
+
+## Contributing
+
+Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). This is a
+community effort to help campuses tie occupancy to bookings; contributions that
+support other 25Live/Niagara configurations are especially valuable.
+
+## License
+
+Licensed under the **GNU General Public License v3.0** (see source headers; add the
+full `LICENSE` text to the repo). Copyright © 2026 Ryan Bibby and contributors.
+
+## Disclaimer
+
+This software writes occupancy schedules to building automation systems. **Test
+thoroughly with `--dry-run` and against a non-production schedule before going
+live.** Provided without warranty; you are responsible for validating behavior
+against your own 25Live instance and Niagara station.
 
 ## Files
 
-| File                  | Purpose                                          |
-|-----------------------|--------------------------------------------------|
-| `main.py`             | The sync script.                                 |
-| `space_mapping.yaml`  | 25Live space → Niagara path map (edit this).     |
-| `editor.py`           | GUI to add/edit rooms & buildings (Tkinter).     |
-| `Edit-Rooms.bat`      | Double-click launcher for the editor (Windows).  |
-| `requirements.txt`    | Python dependencies.                             |
-| `Test.py`             | Offline checks for the merge logic + editor I/O. |
+| File                         | Purpose                                             |
+|------------------------------|-----------------------------------------------------|
+| `main.py`                    | The sync script.                                    |
+| `editor.py`                  | GUI to add/edit rooms & buildings (Tkinter).        |
+| `Edit-Rooms.bat`             | Double-click launcher for the editor (Windows).     |
+| `config.example.yaml`        | Settings template → copy to `config.yaml`.          |
+| `space_mapping.example.yaml` | Room map template → copy to `space_mapping.yaml`.   |
+| `requirements.txt`           | Python dependencies.                                |
+| `Test.py`                    | Offline tests for the merge logic + editor I/O.     |
+| `CONTRIBUTING.md`            | How to contribute.                                  |

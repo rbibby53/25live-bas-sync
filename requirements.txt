@@ -3,3 +3,7 @@
 requests>=2.31,<3
 python-dateutil>=2.8,<3
 PyYAML>=6,<7
+# REQUIRED on Windows: Windows has no system timezone database, so
+# zoneinfo.ZoneInfo("America/New_York") raises ZoneInfoNotFoundError unless the
+# tzdata package is installed. Harmless on Linux/macOS.
+tzdata>=2024.1
