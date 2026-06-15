@@ -8,17 +8,25 @@
 #
 # space_mapping.yaml is gitignored so your real room list stays local.
 #
-# Two sections:
+# Up to three sections:
 #   buildings:  each building's roll-up schedule, defined ONCE.
-#   spaces:     the rooms; each room names the building it belongs to.
+#   floors:     (optional) per-floor hallway schedules for buildings that control
+#               hallway HVAC per floor.
+#   spaces:     the rooms; each names its building and (optionally) its floor.
 #
 # HOW THE BUILDING CALENDAR IS BUILT
 #   Every room that names a `building` is automatically unioned into that
 #   building's occupancy schedule. So if ANY room in the building is occupied,
-#   the building schedule (hallways, lobbies, common AHUs) runs HVAC too.
-#   You do NOT repeat the building's Niagara path on each room — you just give
-#   the building id. That makes "all rooms in the building" the default and
-#   removes the chance of forgetting to wire one up.
+#   the building schedule (lobbies, common AHUs) runs HVAC too. You do NOT
+#   repeat the building's Niagara path on each room — you just give the building
+#   id. That makes "all rooms in the building" the default.
+#
+# PER-FLOOR HALLWAY HVAC
+#   For buildings controlled per floor, define each floor under `floors:` and
+#   give each room a `floor:`. A room then ALSO drives its floor's hallway
+#   schedule — so floors roll up into the building (room -> floor -> building):
+#   the floor hallway runs if any room on that floor is booked, and the building
+#   runs if any floor is.
 #
 # ── buildings: fields ──
 #   id            (required)  short key that rooms reference (e.g. social_sciences)
@@ -35,6 +43,11 @@
 #                             in 25Live (e.g. an atrium); its own events then also
 #                             count toward the building schedule
 #
+# ── floors: fields ── (optional section)
+#   building      (required)  id of the building this floor belongs to
+#   level         (required)  the floor number (integer)
+#   niagara_path  (required)  this floor's hallway schedule slot
+#
 # ── spaces: (room) fields ──
 #   space_id              (required)  25Live numeric space id (from the space's
 #                                     URL / detail in 25Live -> Locations)
@@ -42,6 +55,9 @@
 #   building              (optional)  id of the building this room rolls into.
 #                                     Omit for a room that should run on its own
 #                                     and NOT drive any building schedule.
+#   floor                 (optional)  floor number; must match a floors: entry
+#                                     for this building. Drives that floor's
+#                                     hallway schedule (in addition to building).
 #   niagara_path          (required)  this room's own schedule slot
 #   pre_condition_minutes (optional)  HVAC lead time BEFORE events. Precedence:
 #                                     room > building > global default (30)
@@ -76,21 +92,37 @@ buildings:
     space_id: 9001            # the atrium is itself bookable in 25Live
 
 
+# Per-floor hallway schedules. Social Sciences controls hallway HVAC per floor,
+# so each floor has its own schedule; a room on floor 2 drives Floor2_Hall (and
+# the building). Omit this whole section for buildings without per-floor control.
+floors:
+
+  - building: social_sciences
+    level: 1
+    niagara_path: "SocialSciences/Floor1_Hall_Occ"
+
+  - building: social_sciences
+    level: 2
+    niagara_path: "SocialSciences/Floor2_Hall_Occ"
+
+
 spaces:
 
-  # Two rooms in Social Sciences — BOTH automatically feed SocialSciences/Building_Occ.
-  # Either one being booked turns on the building (hallway/lobby) HVAC.
+  # Two Social Sciences rooms on DIFFERENT floors. Each drives its own floor's
+  # hallway schedule; both also roll up to SocialSciences/Building_Occ.
   - space_id: 1234
     space_name: "Social Sciences 1021"
     building: social_sciences
+    floor: 1
     niagara_path: "SocialSciences/Rm1021_Occ"
     pre_condition_minutes: 45        # large lecture hall — longer warm-up
     post_buffer_minutes: 15
 
   - space_id: 1235
-    space_name: "Social Sciences 1022"
+    space_name: "Social Sciences 2014"
     building: social_sciences
-    niagara_path: "SocialSciences/Rm1022_Occ"
+    floor: 2
+    niagara_path: "SocialSciences/Rm2014_Occ"
 
   # A lab in Engineering Tech — rolls into EngTech/Building_Occ.
   - space_id: 2050

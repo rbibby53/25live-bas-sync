@@ -1,0 +1,28 @@
+# Keep the build context small and never leak local config/secrets into the
+# image. (The Dockerfile only COPYs main.py, the entrypoint, and requirements,
+# but this also speeds up builds.)
+.git
+.gitignore
+.github
+.idea
+.venv
+venv
+__pycache__
+*.py[cod]
+*.bak
+
+# Local, site-specific config & secrets — mounted at runtime, not built in.
+.env
+config.yaml
+defaults.yaml
+space_mapping.yaml
+config/
+logs/
+*.log
+
+# Not needed at runtime
+editor.py
+Edit-Rooms.bat
+Test.py
+*.md
+LICENSE

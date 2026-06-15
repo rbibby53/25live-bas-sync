@@ -4,6 +4,9 @@ config.yaml
 defaults.yaml
 space_mapping.yaml
 
+# Docker secrets (passwords for docker compose) — never commit.
+.env
+
 # Python
 __pycache__/
 *.py[cod]

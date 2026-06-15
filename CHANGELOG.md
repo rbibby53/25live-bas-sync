@@ -7,6 +7,26 @@ semantic versioning once it reaches a tagged release.
 ## [Unreleased]
 
 ### Added
+- **Docker support.** A `Dockerfile`, `docker-compose.yml`, and entrypoint run
+  the headless sync in a container. One-shot by default (pass `--validate` /
+  `--dry-run` straight through; ideal for host cron or a k8s CronJob) with an
+  optional built-in daily scheduler (`SYNC_AT=HH:MM`) so `docker compose up -d`
+  is a self-contained nightly sync. Secrets stay in the environment / a
+  gitignored `.env`; config is mounted at `/config`. New `BAS_SPACE_MAP` env var
+  (parallel to `BAS_CONFIG` / `BAS_DEFAULTS`) points the sync at its room map.
+- **Editor: Connection tab + auto theme.** The GUI now edits `config.yaml`
+  (25Live, Niagara, timezone) directly, so it's a one-stop shop — one Save writes
+  the room map, connection settings, and defaults together. Passwords stay in env
+  vars and unexposed sections (`retry`, `alerts`) are preserved. The window also
+  follows the OS light/dark appearance.
+- **Editor: usability pass.** Per-table live search, click-to-sort columns,
+  vertical scrollbars, a Duplicate action, a right-click context menu, keyboard
+  shortcuts (Enter to edit, Del to delete), a status bar with live counts, and
+  tab labels that show item counts.
+- **Per-floor hallway HVAC.** Optional `floors:` section (building + level +
+  niagara_path) and a per-room `floor:`. A room drives its floor's hallway
+  schedule, and floors roll up into the building (room → floor → building). New
+  **Floors** tab and per-room floor field in the editor.
 - **`defaults.yaml`** — global scheduling defaults (run-up, run-down, merge-gap,
   lookahead) split into their own operator-tunable file, with a **Defaults** tab
   in the editor and a `--defaults` flag. Connection/auth settings stay in

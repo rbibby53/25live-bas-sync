@@ -261,6 +261,145 @@ spaces:
     assert sm["3"].post_buffer_minutes == CONFIG["collegenet"]["default_post_buffer_minutes"]
 
 
+def test_floor_rollup_room_to_floor_to_building():
+    """A room on a floor drives its floor's hallway schedule AND the building;
+    each floor's schedule only reflects its own rooms."""
+    yaml_text = """
+buildings:
+  - id: sci
+    niagara_path: "Sci/Building_Occ"
+floors:
+  - building: sci
+    level: 1
+    niagara_path: "Sci/Floor1_Hall"
+  - building: sci
+    level: 2
+    niagara_path: "Sci/Floor2_Hall"
+spaces:
+  - space_id: 1
+    building: sci
+    floor: 1
+    niagara_path: "Sci/Rm1"
+  - space_id: 2
+    building: sci
+    floor: 2
+    niagara_path: "Sci/Rm2"
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        sm = load_space_map(path, CONFIG)
+    finally:
+        os.unlink(path)
+
+    # Loader wires each room to its floor schedule and still to the building.
+    assert sm["1"].floor_schedule_path == "Sci/Floor1_Hall"
+    assert sm["1"].building_schedule_path == "Sci/Building_Occ"
+    assert sm["2"].floor_schedule_path == "Sci/Floor2_Hall"
+
+    # Rm1 occupied morning, Rm2 occupied afternoon.
+    events = [event(1, dt(9), dt(10), "A"), event(2, dt(14), dt(15), "B")]
+    res = ScheduleBuilder(default_merge_gap_minutes=5).build(events, sm)
+    assert len(res["Sci/Floor1_Hall"]) == 1          # only Rm1
+    assert len(res["Sci/Floor2_Hall"]) == 1          # only Rm2
+    assert len(res["Sci/Building_Occ"]) == 2         # both floors roll up
+
+
+def test_unknown_floor_warns_and_skips():
+    """A room referencing a floor with no matching floors: entry gets no floor
+    schedule (but still rolls up to its building)."""
+    yaml_text = """
+buildings:
+  - id: sci
+    niagara_path: "Sci/Building_Occ"
+spaces:
+  - space_id: 1
+    building: sci
+    floor: 3
+    niagara_path: "Sci/Rm1"
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        sm = load_space_map(path, CONFIG)
+    finally:
+        os.unlink(path)
+    assert sm["1"].floor == 3
+    assert sm["1"].floor_schedule_path is None       # no matching floor entry
+    assert sm["1"].building_schedule_path == "Sci/Building_Occ"
+
+
+def test_editor_floors_roundtrip():
+    """dump_mapping/load_mapping carry the floors section; floors only emitted
+    when present."""
+    import editor
+    buildings = [{"id": "sci", "niagara_path": "Sci/Building_Occ"}]
+    floors = [{"building": "sci", "level": 1, "niagara_path": "Sci/Floor1_Hall"}]
+    rooms = [{"space_id": 1, "building": "sci", "floor": 1,
+              "niagara_path": "Sci/Rm1"}]
+    text = editor.dump_mapping(buildings, floors, rooms)
+    assert "floors:" in text
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(text)
+        path = fh.name
+    try:
+        b2, f2, r2 = editor.load_mapping(path)
+    finally:
+        os.unlink(path)
+    assert f2 == [{"building": "sci", "level": 1, "niagara_path": "Sci/Floor1_Hall"}]
+    assert r2[0]["floor"] == 1
+    # No floors -> the section is omitted entirely.
+    assert "floors:" not in editor.dump_mapping(buildings, [], rooms)
+
+
+def test_load_config_rejects_malformed_yaml():
+    """Malformed config YAML surfaces as a clean ConfigError, not a raw
+    YAMLError traceback."""
+    import main
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write("collegenet: [unclosed\n")   # invalid YAML
+        path = fh.name
+    try:
+        raised = False
+        try:
+            main.load_config(path)
+        except main.ConfigError:
+            raised = True
+        assert raised, "expected ConfigError on malformed YAML"
+    finally:
+        os.unlink(path)
+
+
+def test_load_space_map_skips_malformed_rows():
+    """A room missing its required niagara_path is skipped with a warning; the
+    valid rooms in the same file still load (one bad row can't abort the load)."""
+    yaml_text = """
+buildings:
+  - id: b
+    niagara_path: "B/Building_Occ"
+  - id: broken          # missing niagara_path -> skipped
+spaces:
+  - space_id: 1
+    building: b
+    niagara_path: "B/Rm1"
+  - space_id: 2         # missing niagara_path -> skipped
+    building: b
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(yaml_text)
+        path = fh.name
+    try:
+        sm = load_space_map(path, CONFIG)
+    finally:
+        os.unlink(path)
+    assert "1" in sm, sm
+    assert "2" not in sm, "room missing niagara_path should be skipped"
+    # The valid room still resolved its building roll-up despite the broken rows.
+    assert sm["1"].building_schedule_path == "B/Building_Occ"
+
+
 def test_overlap_helper():
     """Sanity-check the OccupancyWindow overlap primitive directly."""
     a = OccupancyWindow(dt(9), dt(10))
@@ -314,15 +453,15 @@ def test_editor_roundtrip_feeds_loader():
          "niagara_path": "A/Rm101_Occ", "pre_condition_minutes": 30},
         {"space_id": 12, "niagara_path": "A/Rm102_Occ"},   # no building
     ]
-    text = editor.dump_mapping(buildings, rooms)
+    text = editor.dump_mapping(buildings, [], rooms)
 
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
         fh.write(text)
         path = fh.name
     try:
         # Round-trips through the editor's own loader...
-        b2, r2 = editor.load_mapping(path)
-        assert len(b2) == 1 and len(r2) == 2, (b2, r2)
+        b2, f2, r2 = editor.load_mapping(path)
+        assert len(b2) == 1 and len(f2) == 0 and len(r2) == 2, (b2, f2, r2)
         # ...and is consumed correctly by the sync's loader.
         space_map = load_space_map(path, CONFIG)
     finally:
@@ -453,6 +592,79 @@ def test_load_config_reads_defaults_file():
     assert cn["default_post_buffer_minutes"] == 25, cn
     assert cn["merge_gap_minutes"] == 8, cn
     assert cn["lookahead_days"] == 14, cn
+
+
+def test_editor_config_form_roundtrip_and_preserves_unknown():
+    """The Connection tab's load → apply → save round-trips the exposed fields,
+    converts types, and leaves sections it doesn't expose (alerts) untouched.
+    Passwords are never written by the form."""
+    import editor
+    original = (
+        "collegenet:\n"
+        "  instance: demo-univ\n"
+        "  include_states: [2, 4]\n"
+        "niagara:\n"
+        "  host: niagara.example.edu\n"
+        "  port: 8443\n"
+        "  https: true\n"
+        "  verify_tls: false\n"
+        "timezone: America/Chicago\n"
+        "alerts:\n"
+        "  enabled: true\n"
+        "  webhook_url: http://hook.example\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(original)
+        path = fh.name
+    try:
+        form = editor.load_config_form(path)
+        # Loaded values surface as form-friendly types.
+        assert form["collegenet.instance"] == "demo-univ"
+        assert form["collegenet.include_states"] == "2, 4"
+        assert form["niagara.port"] == "8443"
+        assert form["niagara.https"] is True
+        assert form["niagara.verify_tls"] == "false"   # bool -> dropdown value
+        assert form["timezone"] == "America/Chicago"
+
+        # Edit a couple of fields, then apply over the on-disk raw + save.
+        form["niagara.port"] = "443"
+        form["collegenet.username"] = "svc_25live"
+        form["niagara.heartbeat_path"] = ""        # blank -> key removed
+        new_cfg = editor.apply_config_form(editor.read_config_raw(path), form)
+        editor.save_config(path, new_cfg)
+
+        raw = editor.read_config_raw(path)
+        assert raw["niagara"]["port"] == 443                  # int, not "443"
+        assert raw["niagara"]["https"] is True                # bool preserved
+        assert raw["collegenet"]["include_states"] == [2, 4]  # parsed back to list
+        assert raw["collegenet"]["username"] == "svc_25live"
+        assert "heartbeat_path" not in raw["niagara"]
+        # Section the form never exposes must survive untouched.
+        assert raw["alerts"] == {"enabled": True,
+                                 "webhook_url": "http://hook.example"}
+        # The form must never introduce a password key.
+        assert "password" not in raw["collegenet"]
+        assert "password" not in raw["niagara"]
+    finally:
+        os.unlink(path)
+        bak = path + ".bak"
+        if os.path.exists(bak):
+            os.unlink(bak)
+
+
+def test_editor_config_form_invalid_int_raises():
+    """A non-numeric value for an int/state field raises ValueError so the GUI
+    can show a clean message instead of writing garbage."""
+    import editor
+    form = {".".join(p): ("" if k != "bool" else False)
+            for p, _l, k, _h in editor._config_fields()}
+    form["niagara.port"] = "not-a-number"
+    raised = False
+    try:
+        editor.apply_config_form({}, form)
+    except ValueError:
+        raised = True
+    assert raised, "expected ValueError on a non-numeric port"
 
 
 def test_editor_defaults_roundtrip_and_fallback():

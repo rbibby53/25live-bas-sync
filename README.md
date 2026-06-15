@@ -115,6 +115,13 @@ Run-up (`pre_condition_minutes`) and run-down (`post_buffer_minutes`) resolve wi
 precedence **room > building > global** — set a building-wide default that all its
 rooms inherit, and override it on individual rooms as needed.
 
+**Per-floor hallway HVAC.** For buildings controlled per floor, add a `floors:`
+section (each floor = its `building`, a numeric `level`, and a hallway
+`niagara_path`) and give each room a `floor:`. A room then drives its floor's
+hallway schedule too, and floors roll up into the building (**room → floor →
+building**): a floor hallway runs if any room on it is booked, and the building
+runs if any floor is. The editor has a **Floors** tab and a per-room floor field.
+
 ### Editing rooms with the GUI
 
 Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
@@ -122,11 +129,21 @@ Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
 - **Rooms** tab — Add/Edit/Delete rooms; the **Building** field is a dropdown of
   your defined buildings, so a room joins its roll-up just by picking it.
 - **Buildings** tab — manage roll-up schedules; renaming a building id repoints the
-  rooms that referenced it.
+  rooms and floors that referenced it.
+- **Floors** tab — define per-floor hallway schedules (building + floor # + path).
+- **Connection** tab — edit the `config.yaml` connection settings (25Live
+  instance/account, Niagara host/port/TLS, timezone) right in the editor.
+  Passwords are never stored here — they stay in the `BAS_*_PASSWORD` env vars —
+  and any sections you don't see (`retry`, `alerts`) are preserved on save.
 - **Defaults** tab — adjust the global run-up/run-down/merge-gap/lookahead values
   (saved to `defaults.yaml`).
 - **Tools** menu — *Test 25Live connection*, *Test Niagara connection*, and
   *Preview (dry run)* run against your `config.yaml` without leaving the editor.
+
+Every table has live search, click-to-sort headers, and a Duplicate action, and
+the whole window **follows your OS light/dark setting** automatically. One Save
+(Ctrl+S) writes the room map, connection settings, and defaults together — a
+single place to configure everything.
 
 It validates required fields and duplicate IDs, warns on missing-building
 references, and keeps a `.bak` of the previous version on save.
@@ -185,6 +202,50 @@ itself, but it can run anywhere that can reach both 25Live and the station.
 Logs default to `logs/25live_sync.log` next to the script (override with
 `log_file` in `config.yaml`); if that directory isn't writable the script logs to
 stdout instead.
+
+## Run with Docker
+
+A `Dockerfile` and `docker-compose.yml` are included for running the **sync**
+headlessly in a container. (The Tkinter editor isn't containerized — edit your
+YAML on a workstation, then mount it in.)
+
+**1. Put your config where the container can mount it.** Create a `config/`
+folder holding `config.yaml`, `defaults.yaml`, and `space_mapping.yaml` (copy the
+`.example` files). **2. Put secrets in `.env`** (copy `.env.example`) — it's
+gitignored and loaded automatically by compose:
+
+```bash
+mkdir -p config && cp config.example.yaml config/config.yaml   # + defaults / space_mapping
+cp .env.example .env                                            # then fill in passwords
+```
+
+```bash
+docker compose run --rm -e SYNC_AT= sync --validate   # one-shot pre-flight (no writes)
+docker compose run --rm -e SYNC_AT= sync --dry-run    # one-shot, fetch + build only
+docker compose up -d                                  # self-scheduling nightly sync
+docker compose logs -f                                # watch it
+```
+
+Two ways to run it:
+
+- **Self-scheduling (default).** `docker compose up -d` keeps the container up and
+  runs the sync once a day at `SYNC_AT` (default `02:00`, in `TZ`). No host cron
+  needed. Set `SYNC_ON_START=1` to also run once on startup.
+- **One-shot.** Clearing `SYNC_AT` makes the container run once and exit with the
+  sync's exit code — ideal for host cron, CI, or a **Kubernetes CronJob**:
+
+  ```bash
+  docker run --rm \
+    -e BAS_25LIVE_PASSWORD=... -e BAS_NIAGARA_PASSWORD=... -e TZ=America/New_York \
+    -v "$(pwd)/config:/config:ro" \
+    25live-niagara-sync --validate
+  ```
+
+Anything after the image name is passed straight to `main.py` (`--validate`,
+`--dry-run`, `--discover`, …). Passwords come from the environment only and are
+never baked into the image; logs go to `docker compose logs` (and to the mounted
+`./logs` if present). The container points at `/config/*.yaml` via the
+`BAS_CONFIG` / `BAS_DEFAULTS` / `BAS_SPACE_MAP` env vars.
 
 ## Niagara setup
 
@@ -257,6 +318,10 @@ against your own 25Live instance and Niagara station.
 | `space_mapping.example.yaml` | Room map template → copy to `space_mapping.yaml`.   |
 | `requirements.txt`           | Python dependencies.                                |
 | `Test.py`                    | Offline tests for the merge logic + editor I/O.     |
+| `Dockerfile`                 | Container image for the headless sync.              |
+| `docker-compose.yml`         | Compose service (scheduled or one-shot runs).       |
+| `docker-entrypoint.sh`       | One-shot by default; optional built-in scheduler.   |
+| `.env.example`               | Docker secrets template → copy to `.env`.           |
 | `CONTRIBUTING.md`            | How to contribute.                                  |
 | `CHANGELOG.md`               | Notable changes.                                    |
 | `LICENSE`                    | GPL-3.0 license text.                               |
