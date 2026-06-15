@@ -49,7 +49,7 @@ import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import defaultdict
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -208,6 +208,36 @@ def _deep_merge(base: dict, override: dict) -> None:
             base[key] = val
 
 
+class ConfigError(Exception):
+    """A YAML file (config / defaults / room map) is unreadable, malformed, or
+    not a mapping. Carries a human-readable, file-named message so callers can
+    report one clean line instead of a raw traceback."""
+
+
+def _read_yaml(path) -> dict:
+    """
+    Load a YAML file into a dict. A missing or empty file yields {}. A parse
+    error, an unreadable file, or a top level that isn't a mapping raises
+    ConfigError naming the file — so a stray tab in config.yaml fails with one
+    clear line instead of a stack trace.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (yaml.YAMLError, OSError) as exc:
+        raise ConfigError(f"{p}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"{p}: expected a YAML mapping at the top level, got "
+            f"{type(data).__name__}.")
+    return data
+
+
 # Global scheduling defaults live in defaults.yaml — a small, GUI-editable file
 # (run-up / run-down / merge-gap / lookahead). These flat keys map onto the
 # internal config so the rest of the code is unchanged.
@@ -230,15 +260,12 @@ def load_config(path: str, defaults_path: Optional[str] = None) -> dict:
     by load_credentials().
     """
     cfg = copy.deepcopy(DEFAULTS)
-    p = Path(path)
-    if p.exists():
-        with open(p, "r", encoding="utf-8") as fh:
-            user = yaml.safe_load(fh) or {}
+    user = _read_yaml(path)
+    if user:
         _deep_merge(cfg, user)
 
-    if defaults_path and Path(defaults_path).exists():
-        with open(defaults_path, "r", encoding="utf-8") as fh:
-            gd = yaml.safe_load(fh) or {}
+    if defaults_path:
+        gd = _read_yaml(defaults_path)
         for file_key, cfg_key in DEFAULTS_FILE_MAP.items():
             if gd.get(file_key) is not None:
                 cfg["collegenet"][cfg_key] = gd[file_key]
@@ -395,6 +422,9 @@ class SpaceConfig:
     merge_gap_minutes: int                # collapse this space's windows within
                                           # this gap (per-space; falls back to
                                           # the global default)
+    floor: Optional[int] = None           # which floor the room is on (if any)
+    floor_schedule_path: Optional[str] = None  # the floor's hallway schedule the
+                                          # room also feeds (floor -> building)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,16 +459,18 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
     """
     Parse space_mapping.yaml into { space_id: SpaceConfig }.
 
-    The YAML has two sections:
+    The YAML has up to three sections:
         buildings:  each building's roll-up schedule, defined ONCE.
-        spaces:     the rooms; each room names the building it belongs to.
+        floors:     (optional) per-floor hallway schedules — each names its
+                    building, a numeric level, and a niagara_path.
+        spaces:     the rooms; each names its building and (optionally) floor.
 
     Every room that names a building is automatically unioned into that
     building's occupancy schedule by ScheduleBuilder — so if ANY room in the
-    building is occupied, the building schedule (hallways, lobbies, common AHUs)
-    is occupied too. You never repeat the building's Niagara path on a room;
-    you just give the building id, which makes "all rooms in the building" the
-    default and removes the chance of forgetting one.
+    building is occupied, the building schedule (lobbies, common AHUs) is
+    occupied too. If the room also names a floor (and that floor is defined for
+    its building), the room additionally feeds that floor's hallway schedule —
+    so floors roll up into the building (room -> floor -> building).
 
     Run-up (pre_condition_minutes) and run-down (post_buffer_minutes) resolve
     with precedence: room override > building override > global default.
@@ -453,18 +485,48 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
             "space_mapping.yaml (or run editor.py) and add your rooms.", path)
         return {}
 
-    with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+    try:
+        data = _read_yaml(path)
+    except ConfigError as exc:
+        logging.error("Could not load room map — %s", exc)
+        return {}
 
-    # 1) Index the building definitions by their id.
-    buildings: dict[str, dict] = {str(b["id"]): b for b in data.get("buildings", [])}
+    # 1) Index the building definitions by their id. A building needs both an id
+    #    and a niagara_path; skip (with a warning) any entry missing one rather
+    #    than letting one bad row abort the whole load.
+    buildings: dict[str, dict] = {}
+    for b in data.get("buildings", []):
+        try:
+            bid = str(b["id"])
+            if not b.get("niagara_path"):
+                raise KeyError("niagara_path")
+        except (KeyError, TypeError) as exc:
+            logging.warning("Skipping building entry missing %s: %r", exc, b)
+            continue
+        buildings[bid] = b
+
+    # 1b) Index floor hallway schedules by (building_id, level).
+    floors_by_key: dict[tuple, str] = {}
+    for f in data.get("floors", []):
+        try:
+            floor_key = (str(f["building"]), int(f["level"]))
+            floor_path = f["niagara_path"]
+        except (KeyError, TypeError, ValueError) as exc:
+            logging.warning("Skipping malformed floors entry (%s): %r", exc, f)
+            continue
+        floors_by_key[floor_key] = floor_path
 
     space_map: dict[str, SpaceConfig] = {}
 
     # 2) Rooms — resolve each room's building id to that building's Niagara path
     #    so the existing roll-up logic unions every room in the building.
     for row in data.get("spaces", []):
-        space_id = str(row["space_id"])
+        try:
+            space_id = str(row["space_id"])
+            room_path = row["niagara_path"]
+        except (KeyError, TypeError) as exc:
+            logging.warning("Skipping room entry missing %s: %r", exc, row)
+            continue
         building_path: Optional[str] = None
         building: Optional[dict] = None
         building_id = row.get("building")
@@ -479,13 +541,32 @@ def load_space_map(path: str, cfg: dict) -> dict[str, SpaceConfig]:
             else:
                 building_path = building["niagara_path"]
 
+        # Optional per-floor hallway schedule (room -> floor -> building).
+        floor: Optional[int] = None
+        floor_path: Optional[str] = None
+        if row.get("floor") is not None and building_id is not None:
+            try:
+                floor = int(row["floor"])
+            except (TypeError, ValueError):
+                logging.warning("Room %s has a non-numeric floor %r — ignoring it.",
+                                space_id, row["floor"])
+            if floor is not None:
+                floor_path = floors_by_key.get((building_id, floor))
+                if floor_path is None:
+                    logging.warning(
+                        "Room %s references floor %s of building '%s' with no "
+                        "matching floors: entry — it will NOT drive a floor "
+                        "schedule.", space_id, floor, building_id)
+
         bld = building or {}
         space_map[space_id] = SpaceConfig(
             space_id=space_id,
             space_name=row.get("space_name", space_id),
             space_type="room",
-            niagara_path=row["niagara_path"],
+            niagara_path=room_path,
             building_schedule_path=building_path,
+            floor=floor,
+            floor_schedule_path=floor_path,
             # Run-up / run-down: room override > building override > global default.
             pre_condition_minutes=_resolve_minutes(
                 row.get("pre_condition_minutes"),
@@ -801,7 +882,10 @@ class ScheduleBuilder:
             by_space[ev.space_id].append(ev)
 
         result: dict[str, list[OccupancyWindow]] = {}
-        building_windows: dict[str, list[OccupancyWindow]] = defaultdict(list)
+        # Accumulated roll-up windows keyed by target schedule path. A room feeds
+        # its floor schedule (if any) AND its building schedule, so floors roll
+        # up into the building (room -> floor -> building).
+        rollup_windows: dict[str, list[OccupancyWindow]] = defaultdict(list)
 
         for space_id, evs in by_space.items():
             sc = space_map[space_id]
@@ -814,22 +898,24 @@ class ScheduleBuilder:
 
             if sc.space_type == "room":
                 result[sc.niagara_path] = windows
+                if sc.floor_schedule_path:
+                    rollup_windows[sc.floor_schedule_path].extend(windows)
                 if sc.building_schedule_path:
-                    building_windows[sc.building_schedule_path].extend(windows)
+                    rollup_windows[sc.building_schedule_path].extend(windows)
             elif sc.space_type == "building":
                 # Direct building booking (e.g. a lobby event)
-                building_windows[sc.niagara_path].extend(windows)
+                rollup_windows[sc.niagara_path].extend(windows)
 
-        # Merge the building roll-ups (rooms + any direct building bookings).
+        # Merge the roll-ups (floor + building, plus direct building bookings).
         # The inputs are each space's already gap-merged windows; here we merge
         # ACROSS spaces using the global default gap. A room's own gap override
         # governs only its own windows — but those windows still carry into the
-        # building contribution, so a room kept "occupied" across a gap keeps
-        # the building occupied too.
-        for bpath, windows in building_windows.items():
+        # roll-up, so a room kept "occupied" across a gap keeps its floor and
+        # building occupied too.
+        for bpath, windows in rollup_windows.items():
             merged = self._merge(sorted(windows, key=lambda w: w.start),
                                  self.default_merge_gap)
-            # If the building path was also a room result, union them
+            # If the roll-up path was also a room result, union them
             if bpath in result:
                 merged = self._merge(sorted(result[bpath] + merged,
                                             key=lambda w: w.start),
@@ -1015,6 +1101,10 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
     except requests.RequestException as exc:
         logging.error("Failed to fetch from 25Live: %s", exc)
         return 4
+    except ET.ParseError as exc:
+        logging.error("25Live returned a response that isn't valid XML "
+                      "(check the instance/base_url and account): %s", exc)
+        return 4
 
     schedule = builder.build(events, space_map)
 
@@ -1039,14 +1129,15 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
             logging.error("Error writing %s: %s", niagara_path, exc)
             failures += 1
 
-    # Also clear schedules that had events before but have none now
-    # (mapped spaces with zero events this week get an explicit empty write)
-    for space_id, sc in space_map.items():
-        if sc.niagara_path not in schedule:
+    # Also clear schedules that had events before but have none now: every
+    # managed path (room, floor, building) with zero events this week gets an
+    # explicit empty write so it goes Unoccupied.
+    for path in _schedule_paths(space_map):
+        if path not in schedule:
             try:
-                n4.write_schedule(sc.niagara_path, [])
+                n4.write_schedule(path, [])
             except Exception as exc:
-                logging.error("Error clearing %s: %s", sc.niagara_path, exc)
+                logging.error("Error clearing %s: %s", path, exc)
                 failures += 1
 
     n4.write_heartbeat()
@@ -1061,13 +1152,15 @@ def run_sync(cfg: dict, dry_run: bool = False) -> int:
 
 
 def _schedule_paths(space_map: dict[str, SpaceConfig]) -> set:
-    """All distinct Niagara schedule paths the sync would write (rooms +
+    """All distinct Niagara schedule paths the sync manages (rooms + floor +
     building roll-ups)."""
     paths = set()
     for sc in space_map.values():
         paths.add(sc.niagara_path)
         if sc.building_schedule_path:
             paths.add(sc.building_schedule_path)
+        if sc.floor_schedule_path:
+            paths.add(sc.floor_schedule_path)
     return paths
 
 
@@ -1132,7 +1225,7 @@ def run_discover(cfg: dict, days: int) -> int:
     cn = CollegeNetClient(cfg["collegenet"], tz, cfg.get("retry"))
     try:
         spaces = cn.discover_spaces(days)
-    except requests.RequestException as exc:
+    except (requests.RequestException, ET.ParseError) as exc:
         logging.error("Discovery failed: %s", exc)
         return 4
 
@@ -1182,7 +1275,9 @@ def main() -> int:
                         help="Path to config.yaml (default: ./config.yaml, or $BAS_CONFIG)")
     parser.add_argument("--defaults",
                         help="Path to defaults.yaml (default: ./defaults.yaml, or $BAS_DEFAULTS)")
-    parser.add_argument("--space-map", help="Override path to space_mapping.yaml")
+    parser.add_argument("--space-map",
+                        help="Path to space_mapping.yaml (default: ./space_mapping.yaml, "
+                             "or $BAS_SPACE_MAP)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch and build schedules but do not write to Niagara")
     parser.add_argument("--validate", action="store_true",
@@ -1198,10 +1293,18 @@ def main() -> int:
                 or str(Path(__file__).parent / "config.yaml"))
     defaults_path = (args.defaults or os.environ.get("BAS_DEFAULTS")
                      or str(Path(__file__).parent / "defaults.yaml"))
-    cfg = load_config(cfg_path, defaults_path)
+    try:
+        cfg = load_config(cfg_path, defaults_path)
+    except ConfigError as exc:
+        # Logging isn't configured yet; bring it up on the default path so this
+        # fatal startup error is recorded, then exit cleanly (no traceback).
+        setup_logging(default_log_file())
+        logging.error("Configuration error — %s", exc)
+        return 1
 
-    if args.space_map:
-        cfg["space_map_file"] = args.space_map
+    space_map = args.space_map or os.environ.get("BAS_SPACE_MAP")
+    if space_map:
+        cfg["space_map_file"] = space_map
     if cfg["log_file"] is None:
         cfg["log_file"] = default_log_file()
 
@@ -1212,6 +1315,17 @@ def main() -> int:
             "config.example.yaml to config.yaml and edit it for your site.",
             cfg_path)
     load_credentials(cfg)   # after logging is up, so warnings are captured
+
+    # Validate the timezone once, up front, so every mode gets the same clear
+    # message instead of a ZoneInfo traceback deep in a run.
+    try:
+        ZoneInfo(cfg["timezone"])
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        logging.error(
+            "Invalid timezone %r — use an IANA name like 'America/New_York'. "
+            "On Windows, make sure the 'tzdata' package is installed. (%s)",
+            cfg["timezone"], exc)
+        return 1
 
     # A "live sync" is the only mode that alerts; --validate/--discover/--dry-run
     # are interactive and just return a code.
