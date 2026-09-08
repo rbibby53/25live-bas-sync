@@ -10,8 +10,8 @@ The data that flows through a sync run, in order:
 
 `Destination` is what makes a mixed-vendor campus work: every schedule the sync
 writes names both the BAS it lives on and the driver-specific address inside
-that BAS, so one run can fan out to Niagara, WebCTRL, EcoStruxure and bare
-BACnet devices at the same time.
+that BAS, so one run can fan out across a mixed campus — WebCTRL here,
+EcoStruxure there, a Niagara supervisor on the older wings — in one pass.
 """
 
 from dataclasses import dataclass, field
@@ -29,6 +29,7 @@ class Destination:
     target:  driver-specific address of the schedule. Its syntax is defined by
              the driver and documented in that driver's module:
                niagara   "SocialSciences/Rm1021_Occ"   (ORD under schedule_base_path)
+             A room may have no target at all; see SpaceConfig.
                bacnet    "12001:5"                     (device instance : schedule instance)
                webctrl   "#bldg_a/rm101/occ_sched"     (WebCTRL reference path)
                ebo       "/Server 1/Bldg A/Rm101/Occ"  (EBO object path)
@@ -89,7 +90,8 @@ class SpaceConfig:
     space_id: str
     space_name: str
     space_type: str                          # "room" or "building"
-    destination: Destination                 # this space's own schedule
+    destination: Optional[Destination]       # this space's own schedule, if it
+                                             # has one — see below
     building_destination: Optional[Destination]  # building roll-up, if any
     pre_condition_minutes: int
     post_buffer_minutes: int
@@ -98,12 +100,24 @@ class SpaceConfig:
                                              # global default
     floor: Optional[int] = None              # which floor the room is on
     floor_destination: Optional[Destination] = None
-    # The floor's hallway schedule this room also feeds. A room drives its own
+    # The floor's corridor schedule this room also feeds. A room drives its own
     # zone, its floor's corridor, AND its building's common areas — so a single
     # evening booking on the third floor lights and conditions that corridor
     # without running the whole tower.
 
+    # `destination` is optional because how finely a building can be scheduled
+    # depends on how it was built out. A room-level VAV retrofit gets its own
+    # schedule object; an older building may only be schedulable at the floor
+    # or building air handler. A room with no `target:` still contributes its
+    # bookings to whatever roll-ups it belongs to — it just doesn't write a
+    # schedule of its own. That is a normal, supported mapping, not a gap.
+
+    def all_destinations(self) -> list:
+        """Every schedule this space writes to, most specific first."""
+        return [d for d in (self.destination, self.floor_destination,
+                            self.building_destination) if d is not None]
+
     def rollup_destinations(self) -> list:
-        """Every roll-up schedule this space contributes to, nearest first."""
+        """The roll-up schedules this space contributes to, nearest first."""
         return [d for d in (self.floor_destination, self.building_destination)
                 if d is not None]

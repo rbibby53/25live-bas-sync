@@ -4,11 +4,14 @@
 """
 Driver registry.
 
-    bacnet    Standard BACnet/IP Schedule objects. The recommended path for
-              Niagara, WebCTRL and EcoStruxure alike — one integration, one
-              published standard, no per-version API contract.
-    niagara   Tridium Niagara N4 BooleanSchedule SpecialEvents over REST, for
-              stations whose schedules are not exported to BACnet or where you
+    bacnet    Standard BACnet/IP Schedule objects, and the driver to reach
+              for first. Automated Logic WebCTRL, Schneider EcoStruxure
+              Building Operation, Tridium Niagara and any other BTL-listed
+              controller all expose them, so one integration covers the whole
+              campus against a published standard rather than a per-vendor,
+              per-version API.
+    niagara   Tridium Niagara N4 BooleanSchedule SpecialEvents over REST — for
+              stations whose schedules are not exported to BACnet, or where you
               want the bookings to live natively in the station.
     rest      Generic REST driver you describe in config.yaml — the escape
               hatch for a vendor API when BACnet is not available.

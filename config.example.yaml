@@ -51,25 +51,31 @@ collegenet:
 
 systems:
 
-  # ── bacnet: the recommended driver ─────────────────────────────────────────
-  # Standard ASHRAE 135 Schedule objects. Tridium Niagara, Automated Logic
-  # WebCTRL and Schneider EcoStruxure Building Operation are all BTL-listed and
-  # all expose them, so this one driver covers the whole campus. It writes only
-  # the Exception_Schedule property — your weekly schedule and schedule default
-  # are left exactly as the controls engineer set them.
+  # ── bacnet: the driver to reach for first ──────────────────────────────────
+  # Standard ASHRAE 135 Schedule objects. Automated Logic WebCTRL, Schneider
+  # EcoStruxure Building Operation, Tridium Niagara and any other BTL-listed
+  # controller are all required to expose them, so this one driver covers the
+  # whole campus. It writes ONLY the Exception_Schedule property — your weekly
+  # schedule, schedule default and Priority_For_Writing are left exactly as the
+  # controls engineer set them.
+  #
+  # Define one system per BAS network or per vendor, whichever matches how your
+  # campus is segmented. The names are yours; rooms and buildings reference
+  # them in space_mapping.yaml.
   #
   # Needs BACpypes3:  pip install -r requirements-bacnet.txt
-  campus_bacnet:
+  webctrl:
     driver: bacnet
 
     # REQUIRED. This host's own NIC address and prefix length. Not a guess —
     # the stack binds to it.
     local_address: "10.4.1.55/24"
 
-    # This sync's BACnet device identity. Pick an instance number that is free
-    # campus-wide and register it wherever you track them.
+    # This sync's BACnet device identity on THIS network. Pick an instance
+    # number that is free campus-wide and register it wherever your team tracks
+    # them; give each system its own.
     device_id: 599001
-    device_name: "25Live-BAS-Sync"
+    device_name: "25Live-BAS-Sync-WebCTRL"
 
     # Foreign-device registration. Required whenever this host is NOT on the
     # same subnet as the controllers — the usual case for a server writing to
@@ -95,9 +101,20 @@ systems:
 
     who_is_timeout: 5
 
+  # A second BACnet system — a different vendor, VLAN, or BBMD domain. Same
+  # driver, its own network identity.
+  ebo_campus:
+    driver: bacnet
+    local_address: "10.4.1.55/24"
+    device_id: 599002
+    device_name: "25Live-BAS-Sync-EBO"
+    bbmd_address: "10.4.9.1"
+    event_priority: 16
+    verify_writes: true
+
   # ── niagara: native N4 REST ────────────────────────────────────────────────
-  # Use when the station's schedules are not exported to BACnet, or when you
-  # want bookings to appear as real Niagara special events in Workbench.
+  # Use when a station's schedules are not exported to BACnet, or when you want
+  # bookings to appear as real Niagara special events in Workbench.
   # Password: BAS_SYS_SUPERVISOR_PASSWORD
   supervisor:
     driver: niagara
@@ -150,7 +167,7 @@ systems:
 
 # Which system a building/room gets when it doesn't name one. Optional when
 # exactly one system is defined.
-default_system: "campus_bacnet"
+default_system: "webctrl"
 
 # Your campus timezone as an IANA name (America/New_York, America/Chicago,
 # America/Denver, America/Los_Angeles, ...).

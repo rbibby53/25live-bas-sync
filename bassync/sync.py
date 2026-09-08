@@ -119,8 +119,7 @@ def run_sync(cfg: dict, dry_run: bool = False, force: bool = False,
     if dry_run:
         return _preview(cfg, tz, schedule)
 
-    verdict = safety.check(cfg, schedule, all_destinations, len(events),
-                           only_system=only_system)
+    verdict = safety.check(cfg, schedule, all_destinations, len(events))
     if not verdict:
         if force:
             logging.warning("SAFETY OVERRIDE (--force): %s", verdict.reason)

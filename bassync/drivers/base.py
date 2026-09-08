@@ -124,7 +124,7 @@ class ScheduleWriter(ABC):
         BACnet exception schedules — and most vendor schedule editors — are
         keyed by calendar date, so an event running 22:00-01:00 has to become
         two entries. Drivers that are date-based call this first; ones that
-        take absolute timestamps (Niagara SpecialEvents) do not need it.
+        take absolute timestamps (the REST drivers) do not need it.
         """
         out: list = []
         for w in windows:

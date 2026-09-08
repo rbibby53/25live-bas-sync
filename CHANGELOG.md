@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning from 1.0 onward.
 
+## [1.1] — 2026-09-08
+
+An audit-and-cleanup release. Five bugs fixed, per-room/per-floor/per-building
+scheduling made explicit, and the docs and examples re-pointed so the project
+reads as what it is — a BACnet tool that happens to include a Niagara REST
+driver — rather than a Niagara tool with BACnet bolted on.
+
+### Added
+- **Rooms may omit `target:`.** How finely a building can be scheduled depends
+  on how it was built out, not on this tool. A room in a building that is only
+  schedulable at the floor or air-handler level now maps with a `building:`
+  (and optionally `floor:`) and no `target:` — its bookings drive the roll-ups
+  and it writes no schedule of its own. All three patterns mix freely in one
+  map; `space_mapping.example.yaml` shows them side by side. A room with
+  neither a `target:` nor a `building:` is still an error, because its bookings
+  would drive nothing.
+- The editor shows such rooms as `(roll-up only)` rather than a blank cell, and
+  its Target field is no longer marked required.
+
+### Fixed
+- **A per-system `timezone:` produced a schedule that never turned off.**
+  Windows were split at the campus's midnight before being converted to the
+  device's zone, so a building in another timezone got an exception that turned
+  ON and had no matching OFF — the controller would have run until the next
+  exception. Windows are now converted before they are split.
+- **Decommissioning rooms tripped the mass-clear safety rail.** Schedules
+  removed from the room map counted as "cleared" even though the run no longer
+  writes them, blocking the next sync with a false alarm. The comparison is now
+  scoped to the schedules the run actually manages — which also subsumes the
+  separate `--system` scoping, so that special case is gone.
+- **One malformed row took down the whole run.** A non-numeric
+  `pre_condition_minutes`, `merge_gap_minutes` or `floor:`, or a list entry that
+  isn't a mapping, raised out of the loader instead of being reported. Bad rows
+  are now collected as errors like every other mapping problem, and the rest of
+  the map still loads.
+- **Out-of-range BACnet instances were accepted.** Instances are 22-bit, and
+  4194303 is the reserved "unconfigured" value a controller reports before
+  commissioning — never a real address. Both are now rejected when the target is
+  parsed.
+- **`space_id: 1234.0` silently never matched.** YAML reads an unquoted decimal
+  as a float, and `str()` gave `"1234.0"`, which never matches the `"1234"`
+  25Live sends — the room just never synced. Integral floats are normalised.
+
+### Changed
+- **Python 3.13 is now the minimum; 3.14 is recommended** and is what the
+  Docker image runs. CI tests both.
+- Documentation and examples are vendor-neutral. WebCTRL and EcoStruxure lead
+  the per-vendor setup section, the examples show a multi-BACnet campus instead
+  of a single Niagara station, and generic prose no longer uses Niagara as the
+  reference platform. The `niagara` driver, `BAS_NIAGARA_PASSWORD` and
+  `niagara_path:` are all unchanged and still supported.
+- New README section, *How finely can you schedule?*, covering the per-room /
+  per-floor / per-building decision and how to map each.
+
 ## [1.0] — 2026-09-08
 
 **First stable release.** The sync is no longer Niagara-specific: it drives any

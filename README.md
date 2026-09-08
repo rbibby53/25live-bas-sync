@@ -5,10 +5,11 @@ pulls confirmed events from **CollegeNET 25Live** (Series25 WebServices) and
 writes them into your building automation system as schedule exceptions, so HVAC
 and lighting pre-condition for booked rooms and stand down when they're empty.
 
-It speaks **standard BACnet**, so it works with **Tridium Niagara**, **Automated
-Logic WebCTRL**, **Schneider EcoStruxure Building Operation**, and any other
-BTL-listed controller — and one nightly run can drive all of them at once on a
-mixed campus.
+It speaks **standard BACnet**, so it is not tied to any one vendor: **Automated
+Logic WebCTRL**, **Schneider EcoStruxure Building Operation**, **Tridium
+Niagara**, and any other BTL-listed controller all expose the same Schedule
+objects. One nightly run drives all of them at once on a mixed campus — and
+schedules each building as finely as that building actually supports.
 
 It's a single-run script meant to be scheduled nightly. It is read-only against
 25Live and only ever writes occupancy schedules.
@@ -16,11 +17,13 @@ It's a single-run script meant to be scheduled nightly. It is read-only against
 ## Contents
 
 - [Why BACnet](#why-bacnet)
+- [How finely can you schedule?](#how-finely-can-you-schedule)
 - [Features](#features)
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Configure](#configure)
 - [Running](#running)
+- [Run with Docker](#run-with-docker)
 - [Safety rails](#safety-rails)
 - [BAS setup, by vendor](#bas-setup-by-vendor)
 - [25Live setup](#25live-setup)
@@ -29,9 +32,9 @@ It's a single-run script meant to be scheduled nightly. It is read-only against
 
 ## Why BACnet
 
-Every one of the three major systems on a typical campus is BTL-listed and
-exposes standard **Schedule objects** (ASHRAE 135 Object_Type 17). So rather
-than chase three vendor APIs across their version histories, the default driver
+Every BTL-listed system exposes standard **Schedule objects** (ASHRAE 135
+Object_Type 17) — that is what the listing requires. So rather than chase a
+separate API per vendor across their version histories, the default driver
 writes the one thing all of them already understand: the `Exception_Schedule`
 property.
 
@@ -66,11 +69,35 @@ the `Exception_Schedule` array limits field controllers actually enforce (often
 10–25 entries); grouping by date caps the array at one entry per day of
 lookahead no matter how heavily booked the rooms are.
 
+## How finely can you schedule?
+
+This is the thing to get right, and **it is not the same campus-wide.** How
+granular you can be is decided by how each building was built out, not by this
+tool. All three patterns are first-class, and they mix freely in one map:
+
+| Pattern | When | How to map it |
+|---|---|---|
+| **Per room** | The room has its own schedulable object — a room-level VAV or FCU. Typical of **WebCTRL** sites, where scheduling is normally done per room. | Give the room a `target:`. |
+| **Per floor** | The building came online with floor-level air handling, so the corridor AHU is the finest real control. | Give the room a `building:` and a `floor:`, and **no** `target:`. |
+| **Per building** | The oldest wings: one air handler for the whole building. | Give the room a `building:` and nothing else. |
+
+A room with **no `target:` is a normal, supported mapping** — it contributes its
+bookings to whatever roll-ups it belongs to and writes no schedule of its own.
+Occupancy always rolls up **room → floor → building**, so a booked room drives
+its own schedule (if it has one), its floor's corridor (if it names a floor),
+and its building's common areas.
+
+The only thing that *is* an error is a room with neither a `target:` nor a
+`building:` — its bookings would drive nothing at all, and the loader says so
+rather than swallowing them.
+
 ## Features
 
 - Pulls the next *N* days of confirmed events for a configured set of spaces.
 - **Mixed-vendor campus in one run** — every room and building names the BAS it
   lives on; rooms inherit their building's.
+- **Per-room, per-floor or per-building scheduling**, mixed freely, matching
+  what each building's controls actually support.
 - Per-room **pre-conditioning** and **post-event** buffers, with building-wide
   and global defaults (precedence **room > building > global**).
 - Merges overlapping/adjacent bookings into clean occupancy windows.
@@ -113,12 +140,14 @@ pip install -r requirements-bacnet.txt
 That pulls in [BACpypes3](https://github.com/JoelBender/BACpypes3). It's kept
 separate and imported lazily, so a Niagara-only site never carries it.
 
-**Requirements:** **Python 3.11 or newer** (3.9 and 3.10 are past end of life
-and no longer receive security fixes; the script refuses to start on them). A
-**local 25Live account** (not SSO) with read access and Series25 WebServices
-enabled. Whatever your BAS side needs — see [BAS setup](#bas-setup-by-vendor).
+**Requirements:** **Python 3.13 or newer — 3.14 recommended.** Older versions
+are past end of life and no longer receive security fixes, which matters for a
+process holding service credentials on a controls network; the script refuses to
+start on them. A **local 25Live account** (not SSO) with read access and
+Series25 WebServices enabled. Whatever your BAS side needs — see
+[BAS setup](#bas-setup-by-vendor).
 
-Tested on 3.11, 3.12, 3.13 and 3.14.
+CI tests 3.13 and 3.14, each with and without BACpypes3.
 
 > **Windows:** `requirements.txt` includes `tzdata` on purpose — Windows has no
 > system timezone database, so without it `ZoneInfo(...)` raises
@@ -164,16 +193,17 @@ by hand or with the GUI.
 
 ### The room map
 
-Two sections: `buildings:` (each roll-up schedule, defined once) and `spaces:`
-(the rooms). Each room names its `building:` by id, and **every room in a
-building is automatically unioned into that building's schedule** — you never
-repeat the building's address on a room, so you can't forget to wire one up.
+Three sections: `buildings:` (each roll-up schedule, defined once), `floors:`
+(optional per-floor corridor schedules) and `spaces:` (the rooms). Each room
+names its `building:` by id, and **every room in a building is automatically
+unioned into that building's schedule** — you never repeat the building's
+address on a room, so you can't forget to wire one up.
 
-Each entry also carries:
+Each entry carries:
 
 - **`system:`** — which BAS it lives on, a key from `systems:` in `config.yaml`.
-  Rooms inherit their building's; buildings fall back to `default_system`. With
-  one system defined you can omit it everywhere.
+  Rooms and floors inherit their building's; buildings fall back to
+  `default_system`. With one system defined you can omit it everywhere.
 - **`target:`** — the schedule's address *within* that system:
 
   | driver | target | meaning |
@@ -184,14 +214,18 @@ Each entry also carries:
   | `niagara` | `slot:/Other/Sched` | an absolute ORD, used as-is |
   | `rest` | whatever your path template expects | |
 
-`space_mapping.example.yaml` documents every field.
+  **Required on a building or floor** — those entries exist to name a schedule.
+  **Optional on a room:** omit it for a building scheduled per floor or per air
+  handler, and the room drives its roll-ups instead. See
+  [How finely can you schedule?](#how-finely-can-you-schedule).
 
-**Per-floor hallway HVAC.** For buildings controlled per floor, add a `floors:`
-section (each floor = its `building`, a numeric `level`, and a hallway
-`niagara_path`) and give each room a `floor:`. A room then drives its floor's
-hallway schedule too, and floors roll up into the building (**room → floor →
-building**): a floor hallway runs if any room on it is booked, and the building
-runs if any floor is. The editor has a **Floors** tab and a per-room floor field.
+- **`floor:`** (rooms) — with a matching `floors:` entry, the room also drives
+  that floor's corridor schedule. Occupancy rolls up **room → floor →
+  building**: a corridor runs if any room off it is booked, and the building
+  runs if any floor is.
+
+`space_mapping.example.yaml` documents every field and shows all three
+granularity patterns side by side.
 
 ### Editing rooms with the GUI
 
@@ -374,29 +408,16 @@ cut-over, and `verify_writes` reading BACnet writes back to confirm they took.
 Whichever system you're on, this populates the *calendar*. You still wire the
 schedule into your equipment once, in the vendor's own tool:
 
-1. Create/identify a schedule object per room and per building roll-up.
+1. Identify (or create) a schedule object at each level you intend to drive —
+   per room, per floor, per building, or a mix. See
+   [How finely can you schedule?](#how-finely-can-you-schedule).
 2. Set its normal weekly value to **Unoccupied** — the sync only writes the
    booking exceptions on top.
-3. Link its output into your occupancy logic (room → that zone; building →
-   common AHUs and hallways).
+3. Link its output into your occupancy logic (room → that zone; floor →
+   corridor AHU; building → common AHUs and lobbies).
 
-Then run `python main.py --validate`.
-
-### Tridium Niagara
-
-**Either driver works.** Two real choices:
-
-- **`niagara` (REST)** — bookings become native Niagara `SpecialEvent`s on a
-  `BooleanSchedule`, visible and editable in Workbench. Best when the station
-  owns the schedules. Confirm the REST contract for your version: `rest_base`
-  (default `/rest/v1`), `special_event_type`, and the ORD style are all settable
-  from `config.yaml`, so adapting is a YAML edit rather than a code change.
-- **`bacnet`** — point it at the station's exported Schedule objects (Niagara's
-  BACnet server exports a schedule via its BACnet Schedule Export descriptor).
-  Best when you want one driver campus-wide.
-
-Get the device instance from the station's BACnet device object; get schedule
-object instances from the export descriptors.
+Then run `python main.py --validate`, which resolves every target without
+writing.
 
 ### Automated Logic WebCTRL
 
@@ -404,7 +425,8 @@ object instances from the export descriptors.
 BACnet Schedule objects in the controllers, so this is the supported, documented
 integration path rather than a workaround.
 
-Find the two numbers you need in WebCTRL: the controller's **device instance**
+WebCTRL sites normally schedule **per room**, so give each room its own
+`target:`. Find the two numbers in WebCTRL: the controller's **device instance**
 (under the module's BACnet properties) and the schedule's **object instance**.
 `--validate` reads each schedule's `object-name` back, so a wrong number fails
 pre-flight instead of writing somewhere unexpected.
@@ -420,12 +442,41 @@ pre-flight instead of writing somewhere unexpected.
 its BACnet Interface. Same two numbers: the device instance of the AS/AS-P, and
 the schedule's object instance.
 
+Older EBO buildings are often only schedulable at the floor or air-handler
+level. That is fine — map those rooms with a `building:` (and a `floor:` where
+the floor has its own AHU) and **no** `target:`, and their bookings drive the
+roll-up.
+
 If your site would rather drive EBO's own REST API — to keep the bookings as
 native EBO objects, or because BACnet isn't permitted between those VLANs — use
 the **`rest`** driver and paste your endpoints into `config.yaml`. Nothing about
 your API is assumed; `config.example.yaml` has a commented starting template and
 `bassync/drivers/rest.py` documents every placeholder. Prove it with
 `--validate` before going live.
+
+### Tridium Niagara
+
+**Either driver works.** Two real choices:
+
+- **`bacnet`** — point it at the station's exported Schedule objects (Niagara's
+  BACnet server exports a schedule via its BACnet Schedule Export descriptor).
+  Best when you want one driver campus-wide. Get the device instance from the
+  station's BACnet device object and the schedule instances from the export
+  descriptors.
+- **`niagara` (REST)** — bookings become native Niagara `SpecialEvent`s on a
+  `BooleanSchedule`, visible and editable in Workbench. Best when the station
+  owns the schedules and you want operators to see them there. Confirm the REST
+  contract for your version: `rest_base` (default `/rest/v1`),
+  `special_event_type`, and the ORD style are all settable from `config.yaml`,
+  so adapting is a YAML edit rather than a code change.
+
+### Any other BTL-listed controller
+
+There is nothing special about the three above. If a device exposes a standard
+Schedule object and lets you write `Exception_Schedule`, the `bacnet` driver
+drives it — point a `target:` at `<device instance>:<schedule instance>` and
+run `--validate`. If a write is silently ignored, `verify_writes` (on by
+default) catches it by reading the array back.
 
 ### Networking for BACnet
 
@@ -489,8 +540,8 @@ python Test.py
 ```
 
 The BACnet encoding test skips itself when BACpypes3 isn't installed. CI runs
-the suite on Python 3.11, 3.12, 3.13 and 3.14, each both with and without
-BACpypes3 installed.
+the suite on Python 3.13 and 3.14, each both with and without BACpypes3
+installed.
 
 ## Contributing
 
@@ -531,4 +582,4 @@ for validating behavior against your own 25Live instance and your own BAS.
 | `docker-entrypoint.sh` | One-shot by default; optional built-in scheduler. |
 | `.env.example` | Docker secrets template → copy to `.env`. |
 | `CONTRIBUTING.md` · `CHANGELOG.md` · `LICENSE` | |
-| `.github/workflows/ci.yml` | CI: offline tests on Python 3.11–3.14, with and without BACpypes3. |
+| `.github/workflows/ci.yml` | CI: offline tests on Python 3.13–3.14, with and without BACpypes3. |

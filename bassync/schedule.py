@@ -55,13 +55,18 @@ class ScheduleBuilder:
                 sc.merge_gap_minutes)
 
             if sc.space_type == "room":
-                # Union rather than assign: two 25Live spaces may legitimately
-                # share one schedule (a divisible room split A/B in 25Live but
-                # served by a single AHU). Assigning would silently drop the
-                # first room's bookings and leave that half of the room cold.
-                self._accumulate(result, sc.destination, windows,
-                                 sc.merge_gap_minutes)
-                # The room feeds its floor corridor AND its building.
+                if sc.destination is not None:
+                    # Union rather than assign: two 25Live spaces may
+                    # legitimately share one schedule (a divisible room split
+                    # A/B in 25Live but served by a single AHU). Assigning
+                    # would silently drop the first room's bookings and leave
+                    # that half of the room cold.
+                    self._accumulate(result, sc.destination, windows,
+                                     sc.merge_gap_minutes)
+                # The room feeds its floor corridor AND its building — whether
+                # or not it has a schedule of its own. A building that can only
+                # be scheduled at the air handler still needs to know its rooms
+                # are booked.
                 for dest in sc.rollup_destinations():
                     rollup_windows[dest].extend(windows)
             elif sc.space_type == "building":
