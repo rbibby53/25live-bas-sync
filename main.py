@@ -43,7 +43,23 @@ import os
 import sys
 from pathlib import Path
 
-from bassync import __version__
+# Oldest Python this is tested against. 3.9 and 3.10 are both past end of life
+# and no longer get security fixes, which matters for something holding service
+# credentials on a building-controls network.
+#
+# Checked here, before importing anything else, because the failure otherwise
+# surfaces as a confusing traceback from deep inside a dependency — and this
+# tends to be run by whoever is on shift, with whatever `python` is on PATH.
+MIN_PYTHON = (3, 11)
+if sys.version_info < MIN_PYTHON:
+    sys.exit(
+        f"25live-bas-sync needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer, "
+        f"but this is Python {sys.version.split()[0]} ({sys.executable}).\n"
+        "Install a supported Python and make sure the scheduled task, cron "
+        "entry, and Edit-Rooms.bat all invoke THAT interpreter — a common cause "
+        "is dependencies installed for one Python and the job running another.")
+
+from bassync import __version__          # noqa: E402 — must follow the check
 from bassync.config import (default_log_file, load_config, load_credentials,
                             resolve_default_system)
 from bassync.drivers import driver_names, load_driver_class

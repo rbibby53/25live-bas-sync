@@ -25,7 +25,8 @@ issues or PRs.
 ```bash
 git clone https://github.com/rbibby53/25live-bas-sync.git
 cd 25live-bas-sync
-python -m venv .venv && . .venv/bin/activate    # (.venv\Scripts\activate on Windows)
+python3.11 -m venv .venv && . .venv/bin/activate   # (.venv\Scripts\activate on Windows)
+# Python 3.11+ required; CI tests 3.11 through 3.14.
 pip install -r requirements.txt
 pip install -r requirements-bacnet.txt          # only for the bacnet driver
 cp config.example.yaml config.yaml              # edit for your test instance

@@ -11,7 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        # 3.11 is the supported floor; 3.14 is current. 3.9 and 3.10
+        # are past end of life and are not supported.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         # The BACnet driver is an optional extra. Run the suite both with and
         # without BACpypes3 installed, so neither the lazy import nor the
         # "skipped" path silently rots.

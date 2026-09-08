@@ -113,14 +113,19 @@ pip install -r requirements-bacnet.txt
 That pulls in [BACpypes3](https://github.com/JoelBender/BACpypes3). It's kept
 separate and imported lazily, so a Niagara-only site never carries it.
 
-**Requirements:** Python 3.9+. A **local 25Live account** (not SSO) with read
-access and Series25 WebServices enabled. Whatever your BAS side needs — see
-[BAS setup](#bas-setup-by-vendor).
+**Requirements:** **Python 3.11 or newer** (3.9 and 3.10 are past end of life
+and no longer receive security fixes; the script refuses to start on them). A
+**local 25Live account** (not SSO) with read access and Series25 WebServices
+enabled. Whatever your BAS side needs — see [BAS setup](#bas-setup-by-vendor).
+
+Tested on 3.11, 3.12, 3.13 and 3.14.
 
 > **Windows:** `requirements.txt` includes `tzdata` on purpose — Windows has no
 > system timezone database, so without it `ZoneInfo(...)` raises
 > `ZoneInfoNotFoundError` and the sync won't start. Install the dependencies for
-> the **same** `python` that the scheduled task and `Edit-Rooms.bat` invoke.
+> the **same** `python` that the scheduled task and `Edit-Rooms.bat` invoke —
+> dependencies installed for one interpreter while the job runs another is the
+> single most common deployment problem here.
 
 ## Configure
 
@@ -407,8 +412,9 @@ safety rail, and the editor's YAML round-trip:
 python Test.py
 ```
 
-The BACnet encoding test skips itself when BACpypes3 isn't installed; CI runs
-the suite both with and without it.
+The BACnet encoding test skips itself when BACpypes3 isn't installed. CI runs
+the suite on Python 3.11, 3.12, 3.13 and 3.14, each both with and without
+BACpypes3 installed.
 
 ## Contributing
 

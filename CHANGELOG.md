@@ -89,6 +89,11 @@ working untouched — see *Upgrading* at the end.
   touches).
 - Per-system passwords via `BAS_SYS_<NAME>_PASSWORD`; a password left in
   `config.yaml` now warns.
+- **Python 3.11 is now the minimum**, checked at startup with an actionable
+  message rather than a traceback from inside a dependency. 3.9 and 3.10 are
+  past end of life and no longer receive security fixes, which matters for a
+  process holding service credentials on a controls network. CI covers 3.11
+  through 3.14.
 - Repository renamed to **25live-bas-sync**.
 
 ### Upgrading from V1.0 RC1 or a beta
