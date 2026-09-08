@@ -40,24 +40,39 @@ DEFAULT_MAP_FILE = Path(__file__).parent / "space_mapping.yaml"
 
 # Written to the top of the file on save so a hand-editor knows the format.
 FILE_HEADER = """\
-# 25Live → Niagara N4 schedule cross-reference.
+# 25Live → BAS schedule cross-reference.
 #
 # This file is managed by editor.py (the Room Mapping Editor) but is plain YAML
 # and safe to hand-edit. See README.md for the full field reference.
 #
 #   buildings:  each building's roll-up schedule, defined once.
-#   spaces:     the rooms; each room names the `building` it belongs to, and
-#               every room in a building is automatically unioned into that
-#               building's occupancy schedule (any room occupied -> building on).
+#   floors:     optional per-floor corridor schedules (building + level).
+#   spaces:     the rooms; each names its `building` and optionally its `floor`.
+#
+# Occupancy rolls up room -> floor -> building: a room being booked runs its own
+# zone, its floor's corridor, and its building's common areas.
+#
+#   system:  which BAS the schedule lives on — a key from `systems:` in
+#            config.yaml. Omit to inherit (room/floor from its building,
+#            building from default_system).
+#   target:  the schedule's address in that system:
+#              bacnet   "12001:5"        device instance : schedule instance
+#                                        ("@10.4.2.30" pins the address)
+#              niagara  "Bldg/Rm101_Occ" ORD under schedule_base_path
+#              rest     whatever your API path template expects
 """
 
 # Field order we emit so the file reads cleanly and diffs stay stable.
-BUILDING_KEY_ORDER = ["id", "name", "niagara_path",
+BUILDING_KEY_ORDER = ["id", "name", "system", "target",
                       "pre_condition_minutes", "post_buffer_minutes", "space_id"]
-ROOM_KEY_ORDER = ["space_id", "space_name", "building", "floor", "niagara_path",
+ROOM_KEY_ORDER = ["space_id", "space_name", "building", "floor", "system", "target",
                   "pre_condition_minutes", "post_buffer_minutes",
                   "merge_gap_minutes", "note"]
-FLOOR_KEY_ORDER = ["building", "level", "niagara_path"]
+FLOOR_KEY_ORDER = ["building", "level", "system", "target"]
+
+# Pre-1.0 key name. Read and migrated to `target` on load, so an existing map
+# opens, edits and saves without anyone doing a find-and-replace.
+LEGACY_TARGET_KEY = "niagara_path"
 
 DEFAULT_DEFAULTS_FILE = Path(__file__).parent / "defaults.yaml"
 
@@ -91,10 +106,26 @@ def load_mapping(path) -> tuple[list[dict], list[dict], list[dict]]:
         return [], [], []
     with open(p, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
-    buildings = list(data.get("buildings", []) or [])
-    floors = list(data.get("floors", []) or [])
-    rooms = list(data.get("spaces", []) or [])
+    buildings = [_migrate_row(b) for b in (data.get("buildings", []) or [])]
+    floors = [_migrate_row(f) for f in (data.get("floors", []) or [])]
+    rooms = [_migrate_row(r) for r in (data.get("spaces", []) or [])]
     return buildings, floors, rooms
+
+
+def _migrate_row(row):
+    """Rename a pre-1.0 `niagara_path:` to `target:`, preserving field order.
+
+    Done on load rather than on save so the editor only ever deals in one key
+    name, and an old map upgrades the first time someone saves it."""
+    if not isinstance(row, dict) or LEGACY_TARGET_KEY not in row:
+        return dict(row) if isinstance(row, dict) else row
+    out = {}
+    for key, value in row.items():
+        if key == LEGACY_TARGET_KEY:
+            out.setdefault("target", value)
+        else:
+            out[key] = value
+    return out
 
 
 def _ordered(row: dict, key_order: list[str]) -> dict:
@@ -195,14 +226,59 @@ def save_defaults(path, values: dict) -> None:
 DEFAULT_CONFIG_FILE = Path(__file__).parent / "config.yaml"
 
 CONFIG_HEADER = """\
-# 25Live → Niagara connection settings. Managed by editor.py (Connection tab)
-# but safe to hand-edit. Passwords are NOT stored here — set them as environment
-# variables: BAS_25LIVE_PASSWORD and BAS_NIAGARA_PASSWORD. See
+# 25Live → BAS connection settings. Managed by editor.py (Connection tab) but
+# safe to hand-edit. Passwords are NOT stored here — set them as environment
+# variables: BAS_25LIVE_PASSWORD and BAS_SYS_<SYSTEM>_PASSWORD. See
 # config.example.yaml and README.md for the full reference.
 """
 
-# (path-in-config, label, kind, hint).  kind: "text" | "int" | "bool".
-CONFIG_SECTIONS = [
+# Fields shown for a BAS system, per driver. The Connection tab edits one
+# system at a time and swaps this group when you pick a different one, so a
+# BACnet system never shows Niagara's ORD boxes and vice versa.
+# (key-within-the-system, label, kind, hint).
+DRIVER_CONFIG_FIELDS = {
+    "bacnet": [
+        ("local_address", "Local NIC address", "text",
+         "THIS host's address and prefix, e.g. 10.4.1.55/24"),
+        ("device_id", "BACnet device ID", "int",
+         "must be free campus-wide"),
+        ("device_name", "Device name", "text", "how this sync identifies itself"),
+        ("bbmd_address", "BBMD address", "text",
+         "needed when this host is not on the controllers' subnet"),
+        ("event_priority", "Exception priority", "int",
+         "1-16, lower wins; 16 lets hand-entered exceptions override"),
+        ("verify_writes", "Verify writes", "bool",
+         "read back after writing to confirm it took"),
+        ("max_special_events", "Max special events", "int",
+         "0 = no cap; set to your controllers' limit"),
+    ],
+    "niagara": [
+        ("host", "Host", "text", "station hostname or IP"),
+        ("port", "Port", "int", "often 443 or 8443"),
+        ("https", "Use HTTPS", "bool", ""),
+        ("username", "Username", "text", ""),
+        ("verify_tls", "Verify TLS", "combo",
+         "true, false, or a path to a CA bundle"),
+        ("schedule_base_path", "Schedule base ORD", "text",
+         "default slot:/Schedules"),
+        ("heartbeat_path", "Heartbeat ORD", "text",
+         "optional; blank to disable"),
+    ],
+    "rest": [
+        ("base_url", "Base URL", "text", "e.g. https://ebo.example.edu"),
+        ("username", "Username", "text", ""),
+        ("verify_tls", "Verify TLS", "combo",
+         "true, false, or a path to a CA bundle"),
+    ],
+    "preview": [
+        ("csv_file", "CSV export path", "text", "blank = log only, no file"),
+    ],
+}
+
+DRIVER_CHOICES = sorted(DRIVER_CONFIG_FIELDS)
+
+# Sections that are the same whatever BAS you are on.
+GLOBAL_CONFIG_SECTIONS = [
     ("25Live (CollegeNET)", [
         (("collegenet", "instance"), "Instance name", "text",
          "CollegeNET-hosted instance; the base URL is derived from it"),
@@ -212,18 +288,8 @@ CONFIG_SECTIONS = [
          "a LOCAL 25Live account (not SSO)"),
         (("collegenet", "include_states"), "Include states", "text",
          "other states already in the file are preserved"),
-    ]),
-    ("Niagara station", [
-        (("niagara", "host"), "Host", "text", "station hostname or IP"),
-        (("niagara", "port"), "Port", "int", "often 443 or 8443"),
-        (("niagara", "https"), "Use HTTPS", "bool", ""),
-        (("niagara", "username"), "Username", "text", ""),
-        (("niagara", "verify_tls"), "Verify TLS", "combo",
-         "true, false, or a path to a CA bundle"),
-        (("niagara", "schedule_base_path"), "Schedule base ORD", "text",
-         "default slot:/Schedules"),
-        (("niagara", "heartbeat_path"), "Heartbeat ORD", "text",
-         "optional; blank to disable"),
+        (("collegenet", "state_param_style"), "State parameter style", "combo",
+         "plus | comma | repeat | none — instances differ; wrong = 0 events"),
     ]),
     ("General", [
         (("timezone",), "Timezone", "combo", "IANA name, e.g. America/New_York"),
@@ -231,20 +297,43 @@ CONFIG_SECTIONS = [
     ]),
 ]
 
+
+def system_config_fields(system_name: str, driver: str) -> list:
+    """(path, label, kind, hint) for one BAS system's settings."""
+    fields = DRIVER_CONFIG_FIELDS.get(driver, [])
+    return [(("systems", system_name, key), label, kind, hint)
+            for key, label, kind, hint in fields]
+
+
+def config_sections(system_name: str, driver: str) -> list:
+    """The Connection tab's sections for the currently selected system."""
+    sections = list(GLOBAL_CONFIG_SECTIONS[:1])
+    if system_name:
+        sections.append((f"BAS system: {system_name}  ({driver or 'no driver'})",
+                         system_config_fields(system_name, driver)))
+    sections.extend(GLOBAL_CONFIG_SECTIONS[1:])
+    return sections
+
 # 25Live event states this project documents (numeric -> label), offered as
 # checkboxes on the Connection tab. Any other states already in config.yaml are
 # preserved untouched.
 INCLUDE_STATE_LABELS = [(2, "Confirmed"), (4, "Tentative")]
 
 
-def _config_fields():
-    """Flatten CONFIG_SECTIONS to a list of (path, label, kind, hint)."""
-    return [f for _section, fields in CONFIG_SECTIONS for f in fields]
+def _config_fields(system_name: str = "", driver: str = ""):
+    """Flatten the sections to a list of (path, label, kind, hint)."""
+    return [f for _section, fields in config_sections(system_name, driver)
+            for f in fields]
+
+
+# Checkbox fields that default to ON when config.yaml doesn't set them. Keyed
+# by the last path segment, since the system name in the middle varies.
+_BOOL_DEFAULT_ON = {"https", "verify_writes"}
 
 
 def _config_default_bool(path_t) -> bool:
     """Default for a checkbox field when config.yaml doesn't set it."""
-    return path_t == ("niagara", "https")        # HTTPS on by default
+    return path_t[-1] in _BOOL_DEFAULT_ON
 
 
 def _dig(node, path):
@@ -294,12 +383,27 @@ def read_config_raw(path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def load_config_form(path) -> dict:
-    """Read config.yaml into a flat {dotted_path: value} for the Connection tab.
-    bool fields come back as bools; everything else as strings ('' if unset)."""
-    raw = read_config_raw(path)
+def config_systems(raw: dict) -> dict:
+    """
+    {system name: driver} from a raw config, migrating a pre-1.0 `niagara:`
+    block so an older file opens with its station already listed.
+    """
+    systems = raw.get("systems")
     out = {}
-    for path_t, _label, kind, _hint in _config_fields():
+    if isinstance(systems, dict):
+        for name, cfg in systems.items():
+            if isinstance(cfg, dict):
+                out[str(name)] = str(cfg.get("driver") or "")
+    if not out and isinstance(raw.get("niagara"), dict):
+        out["niagara"] = "niagara"
+    return out
+
+
+def form_from_raw(raw: dict, system_name: str = "", driver: str = "") -> dict:
+    """Flat {dotted_path: value} for the Connection tab, from a raw config.
+    bool fields come back as bools; everything else as strings ('' if unset)."""
+    out = {}
+    for path_t, _label, kind, _hint in _config_fields(system_name, driver):
         val = _dig(raw, path_t)
         fid = ".".join(path_t)
         if kind == "bool":
@@ -313,10 +417,15 @@ def load_config_form(path) -> dict:
     return out
 
 
+def load_config_form(path, system_name: str = "", driver: str = "") -> dict:
+    """Read config.yaml into the Connection tab's flat form."""
+    return form_from_raw(read_config_raw(path), system_name, driver)
+
+
 def _coerce_config_value(s: str, kind: str, path_t):
     if path_t == ("collegenet", "include_states"):
         return [int(x) for x in s.replace(",", " ").split()]
-    if path_t == ("niagara", "verify_tls"):
+    if path_t[-1] == "verify_tls":
         low = s.lower()
         if low in ("true", "yes", "1"):
             return True
@@ -328,12 +437,17 @@ def _coerce_config_value(s: str, kind: str, path_t):
     return s
 
 
-def apply_config_form(raw: dict, form: dict) -> dict:
+def apply_config_form(raw: dict, form: dict, system_name: str = "",
+                      driver: str = "") -> dict:
     """Return a deep copy of `raw` with the Connection-tab fields applied. Blank
-    text/int fields remove the key (so main.py's defaults apply); bool fields are
-    always written. Raises ValueError on a non-numeric int / state value."""
+    text/int fields remove the key (so the built-in defaults apply); bool fields
+    are always written. Raises ValueError on a non-numeric int / state value."""
     out = copy.deepcopy(raw) if isinstance(raw, dict) else {}
-    for path_t, label, kind, _hint in _config_fields():
+    if system_name:
+        # The driver is what decides which fields mean anything, so it is
+        # written even though it is not one of the form's own fields.
+        _set_path(out, ("systems", system_name, "driver"), driver)
+    for path_t, label, kind, _hint in _config_fields(system_name, driver):
         fid = ".".join(path_t)
         raw_val = form.get(fid)
         if kind == "bool":
@@ -574,6 +688,15 @@ def run_gui(map_path: Path) -> int:
             self.destroy()
 
     NONE_LABEL = "(none)"
+    # Rooms and floors inherit their building's system; buildings fall back to
+    # config.yaml's default_system. Both are stored as "no system key".
+    INHERIT_LABEL = "(inherit)"
+    DEFAULT_LABEL = "(default)"
+
+    def _strip_sentinels(values: dict) -> None:
+        """Drop the placeholder system labels — absent means inherit."""
+        if values.get("system") in (None, "", INHERIT_LABEL, DEFAULT_LABEL):
+            values.pop("system", None)
 
     class EditorApp(tk.Tk):
         def __init__(self, path: Path):
@@ -629,19 +752,30 @@ def run_gui(map_path: Path) -> int:
                         "Defaults", f"'{label}' must be a whole number.")
                     return False
 
-            # Collect + validate the Connection tab. Re-read the file so any
-            # sections we don't expose (retry, alerts, …) are preserved.
+            # Collect + validate the Connection tab. The working copy already
+            # carries edits to systems other than the one on screen, and it was
+            # seeded from the file, so sections the form doesn't expose (retry,
+            # alerts, safety, …) survive the round trip.
             config_form = {fid: var.get()
                            for fid, (var, _kind, _path) in self._config_vars.items()}
             states = sorted({s for s, v in self._include_vars.items() if v.get()}
                             | set(self._include_extra))
             config_form["collegenet.include_states"] = ", ".join(str(s) for s in states)
             try:
-                new_config = apply_config_form(read_config_raw(self.config_path),
-                                               config_form)
+                new_config = apply_config_form(
+                    self._config_raw, config_form, self._config_system,
+                    self._current_driver())
             except ValueError as exc:
                 messagebox.showerror("Connection", f"Invalid setting — {exc}")
                 return False
+            # With one system defined, make it the default so rooms need no
+            # `system:` key at all. With several, leave whatever is set.
+            systems = new_config.get("systems") or {}
+            if len(systems) == 1:
+                new_config["default_system"] = next(iter(systems))
+            elif systems and not new_config.get("default_system"):
+                new_config["default_system"] = self._config_system
+            self._config_raw = new_config
 
             bad = unknown_building_refs(self.buildings, self.rooms)
             if bad and not messagebox.askyesno(
@@ -662,7 +796,8 @@ def run_gui(map_path: Path) -> int:
             self._update_status()
             messagebox.showinfo(
                 "Saved", f"Saved {len(self.rooms)} rooms, {len(self.buildings)} "
-                f"buildings, {len(self.floors)} floors, connection settings, and "
+                f"buildings, {len(self.floors)} floors, "
+                f"{len(new_config.get('systems') or {})} BAS system(s), and "
                 "global defaults.")
             return True
 
@@ -698,8 +833,8 @@ def run_gui(map_path: Path) -> int:
             toolm = self._menu(bar)
             toolm.add_command(label="Test 25Live connection",
                               command=self._test_25live)
-            toolm.add_command(label="Test Niagara connection",
-                              command=self._test_niagara)
+            toolm.add_command(label="Test BAS connections",
+                              command=self._test_systems)
             toolm.add_separator()
             toolm.add_command(label="Preview (dry run)…", command=self._preview)
             bar.add_cascade(label="Tools", menu=toolm)
@@ -708,44 +843,84 @@ def run_gui(map_path: Path) -> int:
             self.bind_all("<Control-s>", lambda e: self._save())
             self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # ── tools (use the sync engine in main.py; need config.yaml) ──
+        # ── tools (use the sync engine in bassync/; need config.yaml) ──
         def _runtime_config(self):
-            import main
-            cfg = main.load_config(str(self.config_path))
-            main.load_credentials(cfg)
-            return main, cfg
+            """The same config the nightly sync would use, secrets included."""
+            from bassync import config as bas_config
+            cfg = bas_config.load_config(str(self.config_path),
+                                         str(self.defaults_path))
+            bas_config.load_credentials(cfg)
+            return bas_config, cfg
 
         def _test_25live(self):
             from zoneinfo import ZoneInfo
             try:
-                main, cfg = self._runtime_config()
+                _cfgmod, cfg = self._runtime_config()
                 if not cfg["collegenet"].get("base_url"):
                     messagebox.showwarning(
                         "Test 25Live",
                         "No 25Live instance/base_url in config.yaml.\n"
-                        "Copy config.example.yaml to config.yaml and set it.")
+                        "Set it on the Connection tab, or copy "
+                        "config.example.yaml to config.yaml.")
                     return
-                cn = main.CollegeNetClient(cfg["collegenet"],
-                                           ZoneInfo(cfg["timezone"]), cfg.get("retry"))
-                ok, detail = cn.check_connection()
+                from bassync.collegenet import CollegeNetClient
+                cn = CollegeNetClient(cfg["collegenet"],
+                                      ZoneInfo(cfg["timezone"]), cfg.get("retry"))
+                try:
+                    ok, detail = cn.check_connection()
+                finally:
+                    cn.close()
                 (messagebox.showinfo if ok else messagebox.showerror)(
                     "Test 25Live", f"{'Connected' if ok else 'FAILED'}\n\n{detail}")
             except Exception as exc:
                 messagebox.showerror("Test 25Live", f"Error: {exc}")
 
-        def _test_niagara(self):
+        def _test_systems(self):
+            """Health-check every configured BAS, one line each.
+
+            Reports them all rather than stopping at the first failure — on a
+            mixed campus "BACnet is fine, the supervisor is down" is the useful
+            answer, not "something is broken"."""
             from zoneinfo import ZoneInfo
             try:
-                main, cfg = self._runtime_config()
-                n4 = main.NiagaraClient(cfg["niagara"],
-                                        ZoneInfo(cfg["timezone"]), cfg.get("retry"))
-                ok = n4.health_check()
-                (messagebox.showinfo if ok else messagebox.showerror)(
-                    "Test Niagara",
-                    "Reachable (HTTP 200 from /about)." if ok
-                    else "Unreachable — check niagara host/port/TLS in config.yaml.")
+                _cfgmod, cfg = self._runtime_config()
+                from bassync.drivers import DriverError, build_driver
             except Exception as exc:
-                messagebox.showerror("Test Niagara", f"Error: {exc}")
+                messagebox.showerror("Test BAS connections", f"Error: {exc}")
+                return
+
+            systems = cfg.get("systems") or {}
+            if not systems:
+                messagebox.showwarning(
+                    "Test BAS connections",
+                    "No BAS systems are configured.\n"
+                    "Add one on the Connection tab.")
+                return
+
+            tz = ZoneInfo(cfg["timezone"])
+            lines, all_ok = [], True
+            for name in sorted(systems):
+                try:
+                    driver = build_driver(name, systems[name], tz, cfg.get("retry"))
+                except DriverError as exc:
+                    lines.append(f"FAIL  {name}: {exc}")
+                    all_ok = False
+                    continue
+                try:
+                    driver.connect()
+                    ok, detail = driver.health_check()
+                except Exception as exc:
+                    ok, detail = False, f"{type(exc).__name__}: {exc}"
+                finally:
+                    driver.close()
+                all_ok = all_ok and ok
+                lines.append(f"{'OK  ' if ok else 'FAIL'}  {name} "
+                             f"({systems[name].get('driver', '?')}): {detail}")
+            self._show_text("Test BAS connections", "\n".join(lines))
+            if not all_ok:
+                messagebox.showwarning(
+                    "Test BAS connections",
+                    "At least one system is unreachable — see the details window.")
 
         def _preview(self):
             import io
@@ -757,7 +932,7 @@ def run_gui(map_path: Path) -> int:
                 if not self._save():
                     return
             try:
-                main, cfg = self._runtime_config()
+                _cfgmod, cfg = self._runtime_config()
                 cfg["space_map_file"] = str(self.path)
                 buf = io.StringIO()
                 handler = _logging.StreamHandler(buf)
@@ -767,7 +942,8 @@ def run_gui(map_path: Path) -> int:
                 prev = root.level
                 root.setLevel(_logging.INFO)
                 try:
-                    main.run_sync(cfg, dry_run=True)
+                    from bassync.sync import run_sync
+                    run_sync(cfg, dry_run=True)
                 finally:
                     root.removeHandler(handler)
                     root.setLevel(prev)
@@ -843,7 +1019,8 @@ def run_gui(map_path: Path) -> int:
                          ("space_name", "Name", 190),
                          ("building", "Building", 130),
                          ("floor", "Floor", 55),
-                         ("niagara_path", "Niagara Path", 220),
+                         ("system", "System", 120),
+                         ("target", "Target", 200),
                          ("pre_condition_minutes", "Pre", 50),
                          ("post_buffer_minutes", "Post", 50),
                          ("merge_gap_minutes", "Gap", 50)],
@@ -855,7 +1032,8 @@ def run_gui(map_path: Path) -> int:
                 self._new_tab("Buildings"), "buildings",
                 columns=[("id", "ID", 150),
                          ("name", "Name", 200),
-                         ("niagara_path", "Niagara Path", 230),
+                         ("system", "System", 120),
+                         ("target", "Target", 210),
                          ("pre_condition_minutes", "Pre", 50),
                          ("post_buffer_minutes", "Post", 50),
                          ("space_id", "Bookable ID", 110)],
@@ -867,7 +1045,8 @@ def run_gui(map_path: Path) -> int:
                 self._new_tab("Floors"), "floors",
                 columns=[("building", "Building", 200),
                          ("level", "Floor #", 80),
-                         ("niagara_path", "Hallway Niagara Path", 340)],
+                         ("system", "System", 120),
+                         ("target", "Corridor Target", 300)],
                 on_add=self._floor_add, on_edit=self._floor_edit,
                 on_delete=self._floor_delete, on_duplicate=self._floor_duplicate,
                 refresh=self._refresh_floors)
@@ -895,17 +1074,125 @@ def run_gui(map_path: Path) -> int:
             outer.columnconfigure(2, weight=1)
             ttk.Label(
                 outer, wraplength=860, justify="left", style="Hint.TLabel",
-                text="Connection settings (config.yaml). Passwords are NOT stored "
-                     "here — set BAS_25LIVE_PASSWORD and BAS_NIAGARA_PASSWORD as "
-                     "environment variables. Saved together with everything else "
-                     "on Save (Ctrl+S)."
+                text="Connection settings (config.yaml). Passwords are NOT "
+                     "stored here — set BAS_25LIVE_PASSWORD and, per system, "
+                     "BAS_SYS_<SYSTEM>_PASSWORD as environment variables. "
+                     "Saved together with everything else on Save (Ctrl+S)."
             ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
+            # Working copy of config.yaml. Edits land here when you switch
+            # systems, so moving between them doesn't discard what you typed.
+            self._config_raw = read_config_raw(self.config_path)
+            self._config_systems = config_systems(self._config_raw)
+            self._config_system = (
+                str(self._config_raw.get("default_system") or "").strip()
+                or (sorted(self._config_systems)[0] if self._config_systems else ""))
+            if self._config_system not in self._config_systems:
+                self._config_system = (sorted(self._config_systems)[0]
+                                       if self._config_systems else "")
+
+            picker = ttk.Frame(outer)
+            picker.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
+            ttk.Label(picker, text="BAS system:").pack(side="left", padx=(0, 8))
+            self._system_var = tk.StringVar(value=self._config_system)
+            self._system_combo = ttk.Combobox(
+                picker, textvariable=self._system_var, width=22, state="readonly",
+                values=sorted(self._config_systems))
+            self._system_combo.pack(side="left")
+            self._system_combo.bind("<<ComboboxSelected>>",
+                                    lambda e: self._switch_system())
+            ttk.Button(picker, text="Add…", width=6,
+                       command=self._add_system).pack(side="left", padx=(6, 0))
+            ttk.Label(picker, text="Driver:").pack(side="left", padx=(16, 8))
+            self._driver_var = tk.StringVar(
+                value=self._config_systems.get(self._config_system, ""))
+            self._driver_combo = ttk.Combobox(
+                picker, textvariable=self._driver_var, width=12, state="readonly",
+                values=DRIVER_CHOICES)
+            self._driver_combo.pack(side="left")
+            self._driver_combo.bind("<<ComboboxSelected>>",
+                                    lambda e: self._switch_driver())
+            ttk.Label(picker, style="Hint.TLabel",
+                      text="  each room/building picks its system in the other tabs"
+                      ).pack(side="left", padx=(12, 0))
+
+            self._config_body = ttk.Frame(outer)
+            self._config_body.grid(row=2, column=0, columnspan=3, sticky="nsew")
+            self._config_body.columnconfigure(2, weight=1)
+            self._build_config_fields()
+
+        def _current_driver(self) -> str:
+            return self._driver_var.get().strip()
+
+        def _capture_config_form(self) -> None:
+            """Fold what's on screen into the working config copy."""
+            if not getattr(self, "_config_vars", None):
+                return
+            form = {fid: var.get() for fid, (var, _k, _p) in self._config_vars.items()}
+            if getattr(self, "_include_vars", None):
+                chosen = [s for s, v in self._include_vars.items() if v.get()]
+                form["collegenet.include_states"] = ", ".join(
+                    str(s) for s in sorted(set(chosen) | set(self._include_extra)))
+            try:
+                self._config_raw = apply_config_form(
+                    self._config_raw, form, self._config_system,
+                    self._current_driver())
+            except ValueError:
+                # A half-typed number shouldn't block switching systems; Save
+                # reports it properly.
+                pass
+
+        def _switch_system(self) -> None:
+            self._capture_config_form()
+            self._config_system = self._system_var.get().strip()
+            self._driver_var.set(self._config_systems.get(self._config_system, ""))
+            self._build_config_fields()
+            self._mark_dirty()
+
+        def _switch_driver(self) -> None:
+            self._capture_config_form()
+            driver = self._current_driver()
+            self._config_systems[self._config_system] = driver
+            _set_path(self._config_raw,
+                      ("systems", self._config_system, "driver"), driver)
+            self._build_config_fields()
+            self._mark_dirty()
+
+        def _add_system(self) -> None:
+            from tkinter import simpledialog
+            name = simpledialog.askstring(
+                "Add BAS system", "Name for the new system\n"
+                "(referenced by rooms and buildings, and by\n"
+                "its BAS_SYS_<NAME>_PASSWORD variable):", parent=self)
+            if not name:
+                return
+            name = name.strip()
+            if name in self._config_systems:
+                messagebox.showerror("Add BAS system",
+                                     f"'{name}' already exists.", parent=self)
+                return
+            self._capture_config_form()
+            self._config_systems[name] = "bacnet"
+            _set_path(self._config_raw, ("systems", name, "driver"), "bacnet")
+            self._config_system = name
+            self._system_combo.configure(values=sorted(self._config_systems))
+            self._system_var.set(name)
+            self._driver_var.set("bacnet")
+            self._build_config_fields()
+            self._mark_dirty()
+
+        def _build_config_fields(self) -> None:
+            for child in self._config_body.winfo_children():
+                child.destroy()
+            outer = self._config_body
             self._config_vars = {}        # fid -> (var, kind, path_tuple)
-            form = load_config_form(self.config_path)
-            raw = read_config_raw(self.config_path)
+            self._include_vars = {}
+            self._include_extra = []
+            driver = self._current_driver()
+            form = form_from_raw(self._config_raw, self._config_system, driver)
+            raw = self._config_raw
             r = 1
-            for section, fields in CONFIG_SECTIONS:
+            for section, fields in config_sections(self._config_system, driver):
                 ttk.Label(outer, text=section, style="Section.TLabel").grid(
                     row=r, column=0, columnspan=3, sticky="w", pady=(12, 4))
                 r += 1
@@ -960,8 +1247,10 @@ def run_gui(map_path: Path) -> int:
                     side="left", padx=(0, 12))
 
         def _config_choices(self, path_t):
-            if path_t == ("niagara", "verify_tls"):
+            if path_t[-1] == "verify_tls":
                 return ["false", "true"]
+            if path_t == ("collegenet", "state_param_style"):
+                return ["plus", "comma", "repeat", "none"]
             if path_t == ("timezone",):
                 try:
                     from zoneinfo import available_timezones
@@ -1021,7 +1310,7 @@ def run_gui(map_path: Path) -> int:
             for key, heading, width in columns:
                 tree.heading(key, text=heading,
                              command=lambda k=key: self._sort_by(table_key, k, refresh))
-                tree.column(key, width=width, stretch=(key == "niagara_path"),
+                tree.column(key, width=width, stretch=(key == "target"),
                             anchor="center" if width <= 80 else "w")
             tree.grid(row=0, column=0, sticky="nsew")
             vsb.grid(row=0, column=1, sticky="ns")
@@ -1112,7 +1401,8 @@ def run_gui(map_path: Path) -> int:
                 self.rooms_tree, self.rooms,
                 lambda r: (r.get("space_id", ""), r.get("space_name", ""),
                            r.get("building", "—"), r.get("floor", ""),
-                           r.get("niagara_path", ""),
+                           r.get("system", "(inherit)"),
+                           r.get("target", ""),
                            r.get("pre_condition_minutes", ""),
                            r.get("post_buffer_minutes", ""),
                            r.get("merge_gap_minutes", "")),
@@ -1124,7 +1414,8 @@ def run_gui(map_path: Path) -> int:
             shown = self._render_rows(
                 self.flr_tree, self.floors,
                 lambda f: (f.get("building", ""), f.get("level", ""),
-                           f.get("niagara_path", "")),
+                           f.get("system", "(inherit)"),
+                           f.get("target", "")),
                 self._flr_filter)
             self._set_tab_count("Floors", shown, len(self.floors))
             self._update_status()
@@ -1133,7 +1424,8 @@ def run_gui(map_path: Path) -> int:
             shown = self._render_rows(
                 self.bld_tree, self.buildings,
                 lambda b: (b.get("id", ""), b.get("name", ""),
-                           b.get("niagara_path", ""),
+                           b.get("system", "(default)"),
+                           b.get("target", ""),
                            b.get("pre_condition_minutes", ""),
                            b.get("post_buffer_minutes", ""),
                            b.get("space_id", "")),
@@ -1148,6 +1440,23 @@ def run_gui(map_path: Path) -> int:
 
         def _building_choices(self) -> list[str]:
             return [NONE_LABEL] + [str(b.get("id")) for b in self.buildings]
+
+        def _system_names(self) -> list[str]:
+            """Systems from the Connection tab's working copy, so a system you
+            just added is immediately pickable without saving first."""
+            raw = getattr(self, "_config_raw", None)
+            if raw is None:
+                raw = read_config_raw(self.config_path)
+            return sorted(config_systems(raw))
+
+        def _system_field(self, inherit_label: str):
+            """A dropdown when systems are configured, free text when not — so
+            the room map can still be built before the connection settings
+            exist."""
+            names = self._system_names()
+            if not names:
+                return ("system", "BAS System (see Connection tab)", "text", None)
+            return ("system", "BAS System", "combo", [inherit_label] + names)
 
         def _floor_choices(self) -> list[str]:
             """Distinct floor numbers already defined, for the room form's
@@ -1169,7 +1478,8 @@ def run_gui(map_path: Path) -> int:
                 ("space_name", "Name", "text", None),
                 ("building", "Building", "combo", self._building_choices()),
                 ("floor", "Floor # (per-floor hallway)", "int", self._floor_choices()),
-                ("niagara_path", "Niagara Path *", "text", None),
+                self._system_field(INHERIT_LABEL),
+                ("target", "Target *", "text", None),
                 ("pre_condition_minutes", "Pre-condition minutes", "int", None),
                 ("post_buffer_minutes", "Post-buffer minutes", "int", None),
                 ("merge_gap_minutes", "Merge-gap minutes", "int", None),
@@ -1185,8 +1495,10 @@ def run_gui(map_path: Path) -> int:
                     return "Space ID is required."
                 if str(values["space_id"]) in existing_ids:
                     return f"Space ID {values['space_id']} is already used by another room."
-                if not values.get("niagara_path"):
-                    return "Niagara Path is required."
+                if not values.get("target"):
+                    return ("Target is required — the schedule's address in its "
+                            "BAS (e.g. \"12001:5\" for BACnet, "
+                            "\"Bldg/Rm101_Occ\" for Niagara).")
                 return None
             return _v
 
@@ -1200,6 +1512,7 @@ def run_gui(map_path: Path) -> int:
             # "(none)" building -> no building key
             if out.get("building") in (None, NONE_LABEL):
                 out.pop("building", None)
+            _strip_sentinels(out)
             return out
 
         def _room_add(self):
@@ -1248,7 +1561,8 @@ def run_gui(map_path: Path) -> int:
             return [
                 ("id", "Building ID *", "text", None),
                 ("name", "Name", "text", None),
-                ("niagara_path", "Niagara Path *", "text", None),
+                self._system_field(DEFAULT_LABEL),
+                ("target", "Target *", "text", None),
                 ("pre_condition_minutes", "Pre-condition minutes (rooms)", "int", None),
                 ("post_buffer_minutes", "Post-buffer minutes (rooms)", "int", None),
                 ("space_id", "Bookable 25Live space_id", "int", None),
@@ -1263,8 +1577,10 @@ def run_gui(map_path: Path) -> int:
                     return "Building ID is required."
                 if str(values["id"]) in existing_ids:
                     return f"Building ID '{values['id']}' is already in use."
-                if not values.get("niagara_path"):
-                    return "Niagara Path is required."
+                if not values.get("target"):
+                    return ("Target is required — the schedule's address in its "
+                            "BAS (e.g. \"12001:5\" for BACnet, "
+                            "\"Bldg/Rm101_Occ\" for Niagara).")
                 return None
             return _v
 
@@ -1272,6 +1588,8 @@ def run_gui(map_path: Path) -> int:
             dlg = FormDialog(self, "Building", self._bld_fields(), values,
                              self._bld_validate(original_index))
             self.wait_window(dlg)
+            if dlg.result is not None:
+                _strip_sentinels(dlg.result)
             return dlg.result
 
         def _bld_add(self):
@@ -1335,7 +1653,8 @@ def run_gui(map_path: Path) -> int:
             return [
                 ("building", "Building *", "combo", building_ids),
                 ("level", "Floor # *", "int", None),
-                ("niagara_path", "Hallway Niagara Path *", "text", None),
+                self._system_field(INHERIT_LABEL),
+                ("target", "Corridor Target *", "text", None),
             ]
 
         def _floor_validate(self, original_index):
@@ -1347,8 +1666,8 @@ def run_gui(map_path: Path) -> int:
                     return "Building is required."
                 if "level" not in values:
                     return "Floor # is required."
-                if not values.get("niagara_path"):
-                    return "Hallway Niagara Path is required."
+                if not values.get("target"):
+                    return "Corridor Target is required."
                 if (str(values["building"]), str(values["level"])) in existing:
                     return (f"Floor {values['level']} of '{values['building']}' "
                             "is already defined.")
@@ -1359,6 +1678,8 @@ def run_gui(map_path: Path) -> int:
             dlg = FormDialog(self, "Floor", self._floor_fields(), values,
                              self._floor_validate(original_index))
             self.wait_window(dlg)
+            if dlg.result is not None:
+                _strip_sentinels(dlg.result)
             return dlg.result
 
         def _floor_add(self):

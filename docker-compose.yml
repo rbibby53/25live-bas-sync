@@ -1,4 +1,4 @@
-# 25Live -> Niagara sync.
+# 25Live -> BAS sync.
 #
 #   docker compose up -d           # self-scheduling nightly sync (SYNC_AT below)
 #   docker compose logs -f         # watch it
@@ -7,26 +7,32 @@
 #
 # Put your config.yaml, defaults.yaml, and space_mapping.yaml in ./config
 # (copy the .example files). Put secrets in a gitignored .env file beside this
-# one — compose loads it automatically:
-#
-#   BAS_25LIVE_PASSWORD=...
-#   BAS_NIAGARA_PASSWORD=...
-#   TZ=America/New_York
+# one — every variable in it is passed through, which is how per-system
+# BAS_SYS_<NAME>_PASSWORD variables reach the container without being listed
+# here by name.
 
 services:
   sync:
     build: .
-    image: 25live-niagara-sync
-    container_name: 25live-niagara-sync
+    image: 25live-bas-sync
+    container_name: 25live-bas-sync
+
+    # Required by the bacnet driver: it binds a real NIC address and needs
+    # broadcast for Who-Is, neither of which works on the default bridge.
+    # Comment this out if every system you use is niagara or rest.
+    network_mode: host
+
+    # Passes through every variable in .env — including per-system
+    # BAS_SYS_<NAME>_PASSWORD names that can't be enumerated ahead of time.
+    env_file:
+      - .env
+
     environment:
-      # Secrets are read from the environment / .env — never baked into config.
-      BAS_25LIVE_PASSWORD: ${BAS_25LIVE_PASSWORD:?set BAS_25LIVE_PASSWORD in .env}
-      BAS_NIAGARA_PASSWORD: ${BAS_NIAGARA_PASSWORD:?set BAS_NIAGARA_PASSWORD in .env}
-      BAS_SMTP_PASSWORD: ${BAS_SMTP_PASSWORD:-}
       TZ: ${TZ:-America/New_York}
       # Built-in daily scheduler. Clear it (-e SYNC_AT=) for a one-shot run.
       SYNC_AT: ${SYNC_AT:-02:00}
       SYNC_ON_START: ${SYNC_ON_START:-0}
+
     volumes:
       - ./config:/config:ro      # config.yaml, defaults.yaml, space_mapping.yaml
       - ./logs:/app/logs         # optional; logs also go to `docker compose logs`

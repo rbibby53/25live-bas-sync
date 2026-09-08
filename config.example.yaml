@@ -1,15 +1,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# config.example.yaml — copy this to config.yaml and edit for YOUR institution.
+# config.example.yaml — copy to config.yaml and edit for YOUR institution.
 # ─────────────────────────────────────────────────────────────────────────────
 #
 #   cp config.example.yaml config.yaml
 #
-# config.yaml is gitignored, so your site's settings stay out of version control.
-# Anything you omit here falls back to the built-in defaults in main.py.
+# config.yaml is gitignored, so your site's settings stay out of version
+# control. Anything you omit falls back to the built-in defaults.
 #
-# SECRETS ARE NOT STORED HERE. Set the two passwords as environment variables:
-#   BAS_25LIVE_PASSWORD     (the 25Live service-account password)
-#   BAS_NIAGARA_PASSWORD    (the Niagara service-account password)
+# SECRETS ARE NOT STORED HERE. Set them as environment variables:
+#   BAS_25LIVE_PASSWORD              the 25Live service-account password
+#   BAS_SYS_<SYSTEM>_PASSWORD        each BAS system's password, e.g.
+#                                    BAS_SYS_SUPERVISOR_PASSWORD
+#   BAS_SMTP_PASSWORD                alert email, if you enable it
 # ─────────────────────────────────────────────────────────────────────────────
 
 collegenet:
@@ -21,45 +23,202 @@ collegenet:
   # Self-hosted Series25? Set base_url explicitly and leave instance blank.
   base_url: ""
 
-  username: "svc-25live"        # a LOCAL 25Live account (NOT SSO) with read access
-  include_states: [2]           # event states to sync: 2=confirmed (add 4 for tentative)
+  username: "svc-25live"     # a LOCAL 25Live account (NOT SSO) with read access
+  include_states: [2]        # 2=confirmed (add 4 for tentative)
+
+  # How the `state` filter is encoded in the query string. Instances differ,
+  # and getting it wrong returns HTTP 200 with ZERO events — which would look
+  # like an empty campus. `--validate` and the safety rail below both guard
+  # against that, but set this correctly rather than relying on them.
+  #   plus    state=2+4     (default)
+  #   comma   state=2,4
+  #   repeat  state=2&state=4
+  #   none    omit it; filter client-side on the returned <state> element
+  state_param_style: "plus"
+
   # Scheduling defaults (run-up / run-down / merge-gap / lookahead) live in
   # defaults.yaml — see defaults.example.yaml.
 
-niagara:
-  host: "localhost"             # station host; localhost if this runs on the station
-  port: 443                     # confirm for your station — often 443 or 8443
-  https: true
-  username: "svc-scheduler"     # a Niagara operator account
-  verify_tls: false             # false for a self-signed cert; else a CA-bundle path
-  schedule_base_path: "slot:/Schedules"          # where your BooleanSchedules live
-  heartbeat_path: "slot:/Schedules/_LastSync"    # a point stamped each run (or "" to disable)
+# ─────────────────────────────────────────────────────────────────────────────
+# BAS systems
+# ─────────────────────────────────────────────────────────────────────────────
+# Every schedule names the system it lives on, so one nightly run can drive a
+# mixed campus. Rooms inherit their building's system; buildings fall back to
+# `default_system`. With exactly one system defined you can omit both.
+#
+# Run `python main.py --list-drivers` for the current list.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Your campus timezone as an IANA name (e.g. America/New_York, America/Chicago,
-# America/Denver, America/Los_Angeles).
+systems:
+
+  # ── bacnet: the recommended driver ─────────────────────────────────────────
+  # Standard ASHRAE 135 Schedule objects. Tridium Niagara, Automated Logic
+  # WebCTRL and Schneider EcoStruxure Building Operation are all BTL-listed and
+  # all expose them, so this one driver covers the whole campus. It writes only
+  # the Exception_Schedule property — your weekly schedule and schedule default
+  # are left exactly as the controls engineer set them.
+  #
+  # Needs BACpypes3:  pip install -r requirements-bacnet.txt
+  campus_bacnet:
+    driver: bacnet
+
+    # REQUIRED. This host's own NIC address and prefix length. Not a guess —
+    # the stack binds to it.
+    local_address: "10.4.1.55/24"
+
+    # This sync's BACnet device identity. Pick an instance number that is free
+    # campus-wide and register it wherever you track them.
+    device_id: 599001
+    device_name: "25Live-BAS-Sync"
+
+    # Foreign-device registration. Required whenever this host is NOT on the
+    # same subnet as the controllers — the usual case for a server writing to
+    # field panels. Point it at the BBMD for the controllers' network.
+    bbmd_address: ""              # e.g. "10.4.2.1" or "10.4.2.1:47808"
+    bbmd_ttl_seconds: 900
+
+    # BACnetSpecialEvent priority, 1-16, LOWER wins. 16 (the default) means any
+    # exception an operator adds by hand — a holiday, a shutdown — overrides
+    # the booking overlay. Raise the precedence only if you want bookings to
+    # beat hand entries, which is rarely what you want.
+    event_priority: 16
+
+    # Read Exception_Schedule back after each write and confirm it took. Some
+    # controllers accept a write and silently ignore it; without this the sync
+    # would report success while the building never changes.
+    verify_writes: true
+
+    # Cap on special events per schedule. One entry per booked DAY, so the
+    # natural maximum is your lookahead_days. 0 = no cap. Set it to your
+    # controllers' documented Exception_Schedule limit once you know it.
+    max_special_events: 0
+
+    who_is_timeout: 5
+
+  # ── niagara: native N4 REST ────────────────────────────────────────────────
+  # Use when the station's schedules are not exported to BACnet, or when you
+  # want bookings to appear as real Niagara special events in Workbench.
+  # Password: BAS_SYS_SUPERVISOR_PASSWORD
+  supervisor:
+    driver: niagara
+    host: "niagara.example.edu"   # localhost if this runs on the station server
+    port: 443                     # confirm — often 443 or 8443
+    https: true
+    username: "svc-scheduler"
+    verify_tls: false             # false for a self-signed cert; else a CA-bundle path
+    schedule_base_path: "slot:/Schedules"
+    heartbeat_path: "slot:/Schedules/_LastSync"   # "" to disable
+    # Confirm these against your station's REST service if writes 404:
+    # rest_base: "/rest/v1"
+    # special_event_type: "baja:BooleanSchedule$SpecialEvent"
+    event_priority: 16
+
+  # ── preview: writes nothing ────────────────────────────────────────────────
+  # Point buildings here while you commission them. They log what they would
+  # do — and optionally land in a CSV to hand a controls contractor — while the
+  # cut-over buildings write for real.
+  not_yet_live:
+    driver: preview
+    csv_file: "logs/preview.csv"
+
+  # ── rest: a vendor API you describe yourself ───────────────────────────────
+  # The escape hatch when BACnet is not available. Nothing is assumed about
+  # your endpoints — paste them in from your vendor's API documentation and
+  # prove them with --validate. Full placeholder reference:
+  # bassync/drivers/rest.py
+  #
+  # ebo_west:
+  #   driver: rest
+  #   base_url: "https://ebo.example.edu"
+  #   username: "svc-scheduler"
+  #   verify_tls: true
+  #   auth:
+  #     mode: bearer                 # basic | bearer | none
+  #     login_path: "/api/rest/v1/login"
+  #     login_payload: {"username": "{username}", "password": "{password}"}
+  #     token_json_path: "token"
+  #   health:
+  #     method: GET
+  #     path: "/api/rest/v1/status"
+  #   clear:
+  #     method: DELETE
+  #     path: "/api/rest/v1/schedules/{target}/exceptions"
+  #   write:
+  #     method: POST
+  #     path: "/api/rest/v1/schedules/{target}/exceptions"
+  #     payload: {"start": "{start_local}", "end": "{end_local}", "value": true}
+
+# Which system a building/room gets when it doesn't name one. Optional when
+# exactly one system is defined.
+default_system: "campus_bacnet"
+
+# Your campus timezone as an IANA name (America/New_York, America/Chicago,
+# America/Denver, America/Los_Angeles, ...).
 timezone: "America/New_York"
 
-# Retry transient 25Live/Niagara errors (timeouts, 429, 5xx). Applied to reads
-# and the idempotent clear; writes are not auto-retried.
+# Retry transient 25Live/BAS errors (timeouts, 429, 5xx). Applied to reads and
+# idempotent clears; writes are never auto-retried, so a retry cannot duplicate
+# a schedule entry.
 retry:
   attempts: 3
   backoff_seconds: 2.0
 
-# Notify on a failed (or optionally successful) sync run. Off by default.
-# Email SMTP password comes from the env var BAS_SMTP_PASSWORD.
+# ─────────────────────────────────────────────────────────────────────────────
+# Safety rails — read this one before you go live
+# ─────────────────────────────────────────────────────────────────────────────
+# The dangerous failure is not a crash. It is a successful-looking run that
+# writes EMPTY schedules everywhere: an expired 25Live account, a changed
+# `state` parameter or an API version bump all return HTTP 200 with zero
+# events, and the sync would faithfully stand the whole campus down.
+#
+# So a run compares itself against the last one and refuses to write if too
+# much occupancy would vanish at once. `--force` overrides it, which is the
+# right answer at semester break when the drop is real.
+safety:
+  enabled: true
+  min_events: 1                 # abort if 25Live returned fewer assignments
+  max_cleared_fraction: 0.34    # abort above this share of previously-occupied
+                                #   schedules going empty in one run
+  state_file: ""                # blank -> logs/last_run.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alerting
+# ─────────────────────────────────────────────────────────────────────────────
+# Notify on a failed (or optionally successful) run. Off by default.
+#
+# Prove it works BEFORE you rely on it:
+#     python main.py --test-alert
+# That sends through every configured channel and reports each one, and it
+# works even while `enabled` is still false.
 alerts:
   enabled: false
   notify_on_success: false
-  webhook_url: ""               # Slack/Teams/generic incoming webhook URL
+
+  # Slack/Teams/generic incoming webhook. Receives {"text": "..."}.
+  webhook_url: ""
+
   email:
     enabled: false
     smtp_host: "smtp.example.edu"
-    smtp_port: 587
-    use_tls: true
+    smtp_port: 587              # 587 STARTTLS · 465 implicit TLS · 25 relay
+
+    # Transport security: starttls | ssl | none
+    #   starttls  connect plain, then upgrade (port 587) — the default
+    #   ssl       TLS from the first byte, i.e. SMTPS (port 465)
+    #   none      plaintext; only for an internal relay on a trusted network
+    # Omit it and port 465 implies ssl, anything else implies starttls. The
+    # pre-1.0 `use_tls: true/false` boolean is still honored.
+    security: "starttls"
+
+    # Leave username blank for an open internal relay that doesn't authenticate.
+    # If you set it, the password MUST be in $BAS_SMTP_PASSWORD — the sync
+    # refuses to send half-authenticated rather than let the relay reject it
+    # with something unhelpful.
     username: "alerts@example.edu"
     from_addr: "alerts@example.edu"
     to_addrs:
       - "facilities@example.edu"
+      - "controls-oncall@example.edu"
 
 # Optional overrides (sensible defaults are used if omitted):
 # space_map_file: "space_mapping.yaml"
