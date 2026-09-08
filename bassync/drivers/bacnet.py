@@ -76,6 +76,12 @@ DEFAULT_EVENT_PRIORITY = 16
 # Seconds to wait for a Who-Is reply before giving up on a device.
 WHO_IS_TIMEOUT = 5.0
 
+# Seconds to allow for the BACnet stack to bind and come up. BACpypes3 retries
+# a failed socket bind indefinitely, so without a ceiling a wrong
+# `local_address` makes a nightly run hang forever instead of failing — which
+# is strictly worse, because a hung job never alerts.
+CONNECT_TIMEOUT = 10.0
+
 # target: "<device>:<schedule>" with an optional "@address[:port]" suffix.
 _TARGET_RE = re.compile(
     r"^\s*(?P<device>\d+)\s*:\s*(?P<schedule>\d+)\s*"
@@ -170,6 +176,7 @@ class BacnetScheduleWriter(ScheduleWriter):
         self.max_special_events = int(cfg.get("max_special_events", 0))
         self.verify_writes = bool(cfg.get("verify_writes", True))
         self.who_is_timeout = float(cfg.get("who_is_timeout", WHO_IS_TIMEOUT))
+        self.connect_timeout = float(cfg.get("connect_timeout", CONNECT_TIMEOUT))
         if not 1 <= self.event_priority <= 16:
             raise DriverError(
                 f"System '{system_name}': event_priority must be 1-16, "
@@ -208,12 +215,25 @@ class BacnetScheduleWriter(ScheduleWriter):
                 "`pip install bacpypes3` (or "
                 "`pip install -r requirements-bacnet.txt`).") from exc
 
+        # Check the address ourselves first. BACpypes3 would retry the bind in
+        # a loop and never surface the reason; this names it immediately, and
+        # lists what the host actually has so the fix is obvious.
+        _check_local_address(self.local_address, self.system_name)
+
         self._loop = asyncio.new_event_loop()
         try:
-            self._app = self._loop.run_until_complete(self._build_app())
+            self._app = self._loop.run_until_complete(
+                asyncio.wait_for(self._build_app(), timeout=self.connect_timeout))
+        except asyncio.TimeoutError as exc:
+            self._close_loop()
+            raise DriverError(
+                f"System '{self.system_name}': the BACnet stack did not come up "
+                f"within {self.connect_timeout:g}s on {self.local_address}. "
+                "Check that the address is free (nothing else is bound to UDP "
+                f"{DEFAULT_BACNET_PORT}) and that the interface is up."
+            ) from exc
         except Exception as exc:
-            self._loop.close()
-            self._loop = None
+            self._close_loop()
             raise DriverError(f"Could not start the BACnet stack: {exc}") from exc
         logging.info("BACnet stack up on %s as device %d (%s)",
                      self.local_address, self.device_id,
@@ -257,12 +277,24 @@ class BacnetScheduleWriter(ScheduleWriter):
             except Exception as exc:                      # noqa: BLE001
                 logging.debug("BACnet app close: %s", exc)
             self._app = None
-        if self._loop is not None:
-            try:
-                self._loop.close()
-            except Exception as exc:                      # noqa: BLE001
-                logging.debug("BACnet loop close: %s", exc)
-            self._loop = None
+        self._close_loop()
+
+    def _close_loop(self) -> None:
+        if self._loop is None:
+            return
+        try:
+            # A timed-out bind leaves BACpypes3's retry task pending; cancel it
+            # so closing the loop doesn't warn about a task that never finished.
+            for task in asyncio.all_tasks(self._loop):
+                task.cancel()
+            self._loop.run_until_complete(asyncio.sleep(0))
+        except Exception as exc:                          # noqa: BLE001
+            logging.debug("BACnet loop drain: %s", exc)
+        try:
+            self._loop.close()
+        except Exception as exc:                          # noqa: BLE001
+            logging.debug("BACnet loop close: %s", exc)
+        self._loop = None
 
     def _run(self, coro):
         if self._loop is None:
@@ -428,6 +460,59 @@ def _bacnet_date(day: _date):
     """A python date as a BACnet Date (year offset from 1900, 1-based weekday)."""
     from bacpypes3.primitivedata import Date
     return Date((day.year - 1900, day.month, day.day, day.isoweekday()))
+
+
+def _check_local_address(local_address: str, system_name: str) -> None:
+    """
+    Fail fast, and usefully, when `local_address` is not this host's.
+
+    Binding a throwaway UDP socket is the portable way to ask "is this address
+    mine?" — it does not depend on enumerating interfaces, which differs across
+    platforms. The port is left at 0 so this never collides with a BACnet stack
+    already running here.
+    """
+    import socket
+    ip = local_address.split("/", 1)[0].split(":", 1)[0].strip()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.bind((ip, 0))
+    except OSError as exc:
+        raise DriverError(
+            f"System '{system_name}': local_address {local_address!r} is not an "
+            f"address on this host ({exc.strerror or exc}). It must be this "
+            "machine's own NIC address with its prefix length, e.g. "
+            f"\"10.4.1.55/24\". Addresses available here: "
+            f"{', '.join(_host_addresses()) or 'none found'}.") from exc
+    finally:
+        probe.close()
+
+
+def _host_addresses() -> list:
+    """
+    This host's IPv4 addresses, for the error message above.
+
+    Two sources, because neither alone is reliable: resolving the hostname
+    misses addresses on a box with no DNS entry for itself, and the
+    connect-to-a-remote trick only ever reveals the primary outbound
+    interface — which is usually, but not always, the one you want here.
+    No packets are sent by the UDP connect.
+    """
+    import socket
+    found = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.add(info[4][0])
+    except OSError:
+        pass
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))     # TEST-NET-1: reserved, unroutable
+        found.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    return sorted(a for a in found if not a.startswith("127."))
 
 
 def _ip_bytes(host: str) -> bytes:

@@ -72,6 +72,44 @@ def setup_logging(log_file: str, verbose: bool = False) -> None:
     )
 
 
+def run_test_alert(cfg: dict) -> int:
+    """
+    Send a test notification and report each channel's outcome.
+
+    Alerting is the one part of the system that only runs when something has
+    already gone wrong — which is exactly when you find out it was never
+    configured correctly. This exercises it on demand.
+    """
+    from datetime import datetime
+
+    alerts = cfg.get("alerts") or {}
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    results = send_alert(
+        alerts,
+        "25Live -> BAS sync: test alert",
+        "This is a test notification from `main.py --test-alert`.\n"
+        f"Sent {stamp}. No sync ran and nothing was written to any BAS.\n\n"
+        "If you are reading this, failure alerts will reach you.",
+        force=True)
+
+    if not results:
+        logging.error(
+            "No alert channels are configured. Set alerts.webhook_url and/or "
+            "alerts.email.smtp_host in config.yaml. (`alerts.enabled` does not "
+            "need to be true for this test, but it does for real alerts.)")
+        return EXIT_ERROR
+
+    logging.info("=== Alert test results ===")
+    for result in results:
+        logging.info("  %s", result)
+    if not alerts.get("enabled"):
+        logging.warning("alerts.enabled is FALSE — real failures will NOT "
+                        "notify. Set it to true once this test passes.")
+    ok = all(r.ok for r in results)
+    logging.info("=== Alert test %s ===", "PASSED" if ok else "FAILED")
+    return EXIT_OK if ok else EXIT_ERROR
+
+
 def print_drivers() -> int:
     print("Available BAS drivers (set as `driver:` under `systems:`):\n")
     for name in driver_names():
@@ -109,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Window for --discover, in days (default 30)")
     mode.add_argument("--list-drivers", action="store_true",
                       help="Show the available BAS drivers and exit")
+    mode.add_argument("--test-alert", action="store_true",
+                      help="Send a test notification through every configured "
+                           "alert channel and report the result. Works even "
+                           "with alerts.enabled false, so you can prove the "
+                           "plumbing before you rely on it")
 
     parser.add_argument("--system", metavar="NAME",
                         help="Limit the run to one system from `systems:` — "
@@ -154,9 +197,11 @@ def main(argv=None) -> int:
 
     # Only a live sync alerts; the other modes are interactive and just return
     # a code to whoever ran them.
-    is_live_sync = not (args.validate or args.discover or args.dry_run)
+    is_live_sync = not (args.validate or args.discover or args.dry_run
+                        or args.test_alert)
 
     mode = ("VALIDATE" if args.validate else "DISCOVER" if args.discover
+            else "TEST ALERT" if args.test_alert
             else "DRY RUN" if args.dry_run else "SYNC")
     systems = cfg.get("systems") or {}
     logging.info("=== 25Live -> BAS sync %s starting (%s, lookahead %d days) ===",
@@ -168,7 +213,9 @@ def main(argv=None) -> int:
 
     code = EXIT_ERROR
     try:
-        if args.validate:
+        if args.test_alert:
+            code = run_test_alert(cfg)
+        elif args.validate:
             code = run_validate(cfg)
         elif args.discover:
             code = run_discover(cfg, args.discover_days)

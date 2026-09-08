@@ -43,6 +43,14 @@ campus. **Existing 1.x deployments keep working** — see *Upgrading* below.
   duplicate `space_id`s, unknown `system:` names, unparseable YAML.
 - Editor: **System** dropdown fed from `config.yaml`, and *Test BAS
   connections* health-checks every configured system in one pass.
+- **`--test-alert`** sends a test notification through every configured channel
+  and reports each result — usable while `alerts.enabled` is still false, so
+  the plumbing can be proven before anyone depends on it.
+- SMTP alerting gained implicit TLS (`security: ssl`, port 465) alongside
+  STARTTLS, explicit `Date`/`Message-ID` headers so alerts aren't quarantined,
+  and separate reporting for connect / TLS / authentication / refused-recipient
+  failures. A `username` with no `$BAS_SMTP_PASSWORD` is now caught before
+  connecting instead of being rejected by the relay with an opaque 5xx.
 - CI runs the suite both with and without BACpypes3 installed.
 
 ### Fixed

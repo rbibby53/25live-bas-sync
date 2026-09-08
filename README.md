@@ -206,6 +206,7 @@ references, and keeps a `.bak` of the previous version on save.
 ```bash
 python main.py --list-drivers   # what BAS integrations are available
 python main.py --validate       # pre-flight: config, auth, reachability, targets
+python main.py --test-alert     # prove the failure alerts actually reach you
 python main.py --discover       # list 25Live spaces with upcoming events
 python main.py --dry-run        # fetch + build, print what WOULD be written
 python main.py                  # live run
@@ -220,6 +221,27 @@ python main.py --force          # override the mass-clear safety check
   encoding — for BACnet, the per-date special events that would go on the wire.
 - **`--discover`** (optionally `--discover-days N`, default 30) lists spaces
   with bookings, as a starter to paste into `space_mapping.yaml`.
+- **`--test-alert`** sends a test notification through every configured channel
+  and reports each one. Worth running the day you set alerting up: alerting is
+  the one component that only runs when something has already gone wrong, which
+  is a bad time to discover the relay rejects your `from` address.
+
+### Alerting
+
+Set `alerts.enabled: true` for a notification when a run fails (or, with
+`notify_on_success`, when it succeeds). Two channels, either or both:
+
+- **Webhook** — Slack, Teams, or anything accepting a JSON `{"text": ...}` POST.
+- **SMTP email** — `starttls` (port 587, the default), `ssl` for implicit
+  TLS/SMTPS (port 465), or `none` for an internal relay on a trusted network.
+  Leave `username` blank for an open relay; if you set it, the password must be
+  in `$BAS_SMTP_PASSWORD`. Connect, TLS, authentication, and per-recipient
+  rejection are each reported separately, because they need four different
+  fixes.
+
+Alerting never changes a run's outcome — a dead mail relay won't turn a
+successful sync into a failure. Pair it with the BAS heartbeat point so you also
+catch the case where the job stops running entirely.
 
 Exit codes (for monitoring): `0` ok · `1` unhandled error · `2` room map problem
 · `3` BAS unreachable · `4` 25Live fetch failed · `5` write failures ·
