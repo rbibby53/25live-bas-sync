@@ -8,9 +8,10 @@
 #
 # space_mapping.yaml is gitignored so your real room list stays local.
 #
-# Two sections:
+# Three sections:
 #   buildings:  each building's roll-up schedule, defined ONCE.
-#   spaces:     the rooms; each room names the building it belongs to.
+#   floors:     optional per-floor corridor schedules (building + level).
+#   spaces:     the rooms; each names its building and optionally its floor.
 #
 # HOW THE BUILDING CALENDAR IS BUILT
 #   Every room that names a `building` is automatically unioned into that
@@ -19,6 +20,13 @@
 #   repeat the building's address on each room — you just give the building id.
 #   That makes "all rooms in the building" the default and removes the chance
 #   of forgetting to wire one up.
+#
+# PER-FLOOR CORRIDORS (room -> floor -> building)
+#   Give a room a `floor:` and define that floor under `floors:`, and the room
+#   ALSO drives its floor's corridor schedule. That is what keeps a single
+#   evening booking on the third floor from conditioning the whole tower, while
+#   still lighting and tempering the corridor someone has to walk down. A room
+#   with no `floor:` still rolls up to its building exactly as before.
 #
 # INHERITANCE
 #   `system`, `pre_condition_minutes` and `post_buffer_minutes` all resolve the
@@ -46,6 +54,9 @@
 #   space_name            (optional)  label for logs; defaults to the id
 #   building              (optional)  id of the building this room rolls into.
 #                                     Omit for a room that runs on its own.
+#   floor                 (optional)  floor number; with a matching `floors:`
+#                                     entry the room also drives that floor's
+#                                     corridor schedule
 #   system                (optional)  overrides the building's system
 #   target                (required)  this room's own schedule address
 #   pre_condition_minutes (optional)  HVAC lead time BEFORE events
@@ -92,6 +103,28 @@ buildings:
     space_id: 9001                  # the atrium is itself bookable in 25Live
 
 
+# ── floors: fields (all optional as a section) ──
+#   building  (required)  the building id these floors belong to
+#   level     (required)  floor number, matching a room's `floor:`
+#   system    (optional)  defaults to the building's system
+#   target    (required)  the corridor schedule's address
+floors:
+
+  - building: social_sciences
+    level: 1
+    target: "12001:110"
+
+  - building: social_sciences
+    level: 2
+    target: "12001:120"
+
+  # A corridor still on the Niagara supervisor even though its building sits on
+  # BACnet — `system:` overrides per floor when a retrofit is only part done.
+  - building: student_center
+    level: 1
+    target: "StudentCenter/Floor1_Corridor"
+
+
 spaces:
 
   # Two rooms in Social Sciences — BOTH automatically feed 12001:100. Either
@@ -99,6 +132,7 @@ spaces:
   - space_id: 1234
     space_name: "Social Sciences 1021"
     building: social_sciences
+    floor: 1                        # also drives 12001:110, the floor-1 corridor
     target: "12001:5"
     pre_condition_minutes: 45       # large lecture hall — longer warm-up
     post_buffer_minutes: 15
@@ -106,6 +140,7 @@ spaces:
   - space_id: 1235
     space_name: "Social Sciences 1022"
     building: social_sciences
+    floor: 2
     target: "12001:6"
 
   # A lab in Engineering Tech — inherits the building's 40-minute run-up.

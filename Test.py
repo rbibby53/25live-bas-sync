@@ -965,31 +965,21 @@ def test_editor_roundtrip_feeds_loader():
              {"space_id": 12, "target": "A/Rm102_Occ"}]
 
     def _check(path):
-        b2, r2 = editor.load_mapping(path)
-        assert len(b2) == 1 and len(r2) == 2, (b2, r2)
+        b2, f2, r2 = editor.load_mapping(path)
+        assert len(b2) == 1 and not f2 and len(r2) == 2, (b2, f2, r2)
         return load_space_map(path, base_config())
 
-    sm = with_yaml(editor.dump_mapping(buildings, rooms), _check)
+    sm = with_yaml(editor.dump_mapping(buildings, [], rooms), _check)
     assert not sm.errors, sm.errors
     assert sm.spaces["11"].building_destination == dest("A/Building_Occ")
     assert sm.spaces["12"].building_destination is None
 
 
-def test_editor_migrates_legacy_key_on_load():
-    """Opening a pre-1.0 map renames niagara_path -> target in place, so saving
-    it upgrades the file without anyone doing a find-and-replace."""
-    import editor
-    text = ("buildings:\n  - id: b\n    niagara_path: 'B/Occ'\n"
-            "spaces:\n  - space_id: 1\n    niagara_path: 'B/Rm1'\n")
-    buildings, rooms = with_yaml(text, editor.load_mapping)
-    assert buildings[0]["target"] == "B/Occ" and "niagara_path" not in buildings[0]
-    assert rooms[0]["target"] == "B/Rm1" and "niagara_path" not in rooms[0]
-
-
 def test_editor_keeps_system_through_a_roundtrip():
     import editor
     rooms = [{"space_id": 1, "system": "campus_bacnet", "target": "12001:5"}]
-    _b, r2 = with_yaml(editor.dump_mapping([], rooms), editor.load_mapping)
+    _b, _f, r2 = with_yaml(editor.dump_mapping([], [], rooms),
+                           editor.load_mapping)
     assert r2[0]["system"] == "campus_bacnet", r2
 
 
@@ -1001,14 +991,18 @@ def test_editor_flags_unknown_building():
 
 
 def test_editor_reads_systems_from_config():
-    """The System dropdown is populated from config.yaml, and a pre-1.0 config
-    still offers its single Niagara system."""
+    """The System dropdowns are populated from config.yaml, and a pre-1.0
+    config still offers its single Niagara station."""
     import editor
-    text = "systems:\n  campus_bacnet:\n    driver: bacnet\n  supervisor:\n    driver: niagara\n"
-    assert with_yaml(text, editor.configured_systems) == ["campus_bacnet", "supervisor"]
-    assert with_yaml("niagara:\n  host: n4\n", editor.configured_systems) == ["niagara"]
+    raw = {"systems": {"campus_bacnet": {"driver": "bacnet"},
+                       "supervisor": {"driver": "niagara"}}}
+    assert editor.config_systems(raw) == {"campus_bacnet": "bacnet",
+                                          "supervisor": "niagara"}
+    # A pre-1.0 config has a bare `niagara:` block instead of `systems:`.
+    assert editor.config_systems({"niagara": {"host": "n4"}}) == {"niagara": "niagara"}
     # A missing or broken config must not stop the editor from opening.
-    assert editor.configured_systems("/nonexistent/config.yaml") == []
+    assert editor.config_systems({}) == {}
+    assert editor.read_config_raw("/nonexistent/config.yaml") == {}
 
 
 def test_editor_defaults_roundtrip_and_fallback():
@@ -1369,6 +1363,294 @@ spaces:
     assert not wrote_anything, "the aborted run must not have written"
     assert forced == sync_mod.EXIT_OK, forced
     assert forced_wrote, "--force must let the run through"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# per-floor corridor roll-up (room -> floor -> building)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_floor_rollup_room_to_floor_to_building():
+    """A booked room drives its own zone, its floor's corridor, AND its
+    building — while the OTHER floor's corridor stays off. That separation is
+    the whole point: one evening seminar shouldn't condition the whole tower."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+floors:
+  - building: b
+    level: 1
+    target: "B/F1_Corridor"
+  - building: b
+    level: 2
+    target: "B/F2_Corridor"
+spaces:
+  - space_id: 1
+    building: b
+    floor: 1
+    target: "B/Rm101"
+  - space_id: 2
+    building: b
+    floor: 2
+    target: "B/Rm201"
+"""
+    cfg = base_config()
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert not sm.errors, sm.errors
+    assert sm.floor_count == 2, sm.floor_count
+    assert sm.spaces["1"].floor_destination == dest("B/F1_Corridor")
+
+    # Only the floor-1 room is booked.
+    schedule = ScheduleBuilder(5).build([event(1, dt(18), dt(20), "E")], sm)
+    for d in sm.destinations():
+        schedule.setdefault(d, [])
+    assert len(schedule[dest("B/Rm101")]) == 1
+    assert len(schedule[dest("B/F1_Corridor")]) == 1, "its own corridor runs"
+    assert len(schedule[dest("B/Occ")]) == 1, "the building runs"
+    assert schedule[dest("B/F2_Corridor")] == [], "the other floor stays off"
+    assert schedule[dest("B/Rm201")] == []
+
+
+def test_floor_destinations_are_cleared_when_empty():
+    """Floor corridors join the managed set, so one with no bookings this week
+    is actively cleared rather than left on last week's schedule."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+floors:
+  - building: b
+    level: 1
+    target: "B/F1_Corridor"
+spaces:
+  - space_id: 1
+    building: b
+    floor: 1
+    target: "B/Rm101"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert sm.destinations() == {dest("B/Rm101"), dest("B/F1_Corridor"),
+                                 dest("B/Occ")}, sm.destinations()
+
+
+def test_unknown_floor_warns_and_skips():
+    """A room naming a floor with no matching entry still syncs and still rolls
+    up to its building — it just drives no corridor. A typo shouldn't cost the
+    room its heat."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+floors:
+  - building: b
+    level: 1
+    target: "B/F1_Corridor"
+spaces:
+  - space_id: 1
+    building: b
+    floor: 9
+    target: "B/Rm901"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert not sm.errors, sm.errors
+    assert any("floor 9" in w for w in sm.warnings), sm.warnings
+    assert sm.spaces["1"].floor_destination is None
+    assert sm.spaces["1"].building_destination == dest("B/Occ")
+
+
+def test_floor_inherits_building_system_and_can_override():
+    """A corridor is usually on the same panel as the rooms off it, so it
+    inherits — but a part-finished retrofit can put it elsewhere."""
+    text = """
+buildings:
+  - id: b
+    system: supervisor
+    target: "B/Occ"
+floors:
+  - building: b
+    level: 1
+    target: "B/F1_Corridor"
+  - building: b
+    level: 2
+    system: campus_bacnet
+    target: "12001:120"
+spaces:
+  - space_id: 1
+    building: b
+    floor: 1
+    target: "B/Rm101"
+  - space_id: 2
+    building: b
+    floor: 2
+    target: "B/Rm201"
+"""
+    cfg = base_config()
+    cfg["systems"] = {"supervisor": {"driver": "preview"},
+                      "campus_bacnet": {"driver": "preview"},
+                      "sys": {"driver": "preview"}}
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert not sm.errors, sm.errors
+    assert sm.spaces["1"].floor_destination.system == "supervisor"
+    assert sm.spaces["2"].floor_destination.system == "campus_bacnet"
+
+
+def test_floor_errors_are_reported():
+    """Structural mistakes in floors: are errors, not silent skips."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+floors:
+  - building: nosuch
+    level: 1
+    target: "X/Hall"
+  - building: b
+    level: notanumber
+    target: "B/Hall"
+  - building: b
+    level: 1
+    target: "B/F1"
+  - building: b
+    level: 1
+    target: "B/F1_again"
+spaces: []
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert any("unknown building 'nosuch'" in e for e in sm.errors), sm.errors
+    assert any("non-numeric level" in e for e in sm.errors), sm.errors
+    assert any("defined twice" in e for e in sm.errors), sm.errors
+
+
+def test_room_gap_carries_into_rollup_contribution():
+    """A room's own wide gap merges its windows, and that merged occupancy
+    carries into the roll-ups — the corridor reflects when the room is really
+    occupied, not when its individual bookings happen to start."""
+    space_map = {
+        "1": space(1, "room", "B/Rm1", building="B/Occ", merge_gap=30),
+    }
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10), "A1"), event(1, dt(10, 20), dt(11), "A2")],
+        space_map)
+    assert len(result[dest("B/Rm1")]) == 1, result[dest("B/Rm1")]
+    assert len(result[dest("B/Occ")]) == 1, result[dest("B/Occ")]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# malformed input handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_load_config_rejects_malformed_yaml():
+    """A stray tab in config.yaml fails with one clear, file-named line rather
+    than a stack trace — and never by silently falling back to defaults, which
+    would write the wrong schedules to the wrong station."""
+    from bassync.config import ConfigError
+    try:
+        with_yaml("collegenet:\n\tinstance: oops\n", load_config)
+    except ConfigError as exc:
+        assert ".yaml" in str(exc), exc
+    else:
+        raise AssertionError("malformed YAML should raise ConfigError")
+    # A top level that isn't a mapping is equally unusable.
+    try:
+        with_yaml("- just\n- a list\n", load_config)
+    except ConfigError as exc:
+        assert "mapping" in str(exc), exc
+    else:
+        raise AssertionError("a non-mapping config should raise ConfigError")
+
+
+def test_read_yaml_tolerates_missing_and_empty():
+    """Missing and empty are normal, not errors — a site that hasn't written
+    defaults.yaml yet must still run."""
+    from bassync.config import read_yaml
+    assert read_yaml("/nonexistent/nothing.yaml") == {}
+    assert with_yaml("", read_yaml) == {}
+    assert with_yaml("# just a comment\n", read_yaml) == {}
+
+
+def test_editor_config_form_roundtrip_preserves_other_sections():
+    """The Connection tab must not eat config it doesn't display — retry,
+    alerts and safety all have to survive a save."""
+    import editor
+    raw = {"systems": {"campus": {"driver": "bacnet",
+                                  "local_address": "10.1.1.5/24"},
+                       "sup": {"driver": "niagara", "host": "n4", "port": 8443}},
+           "default_system": "campus",
+           "retry": {"attempts": 5},
+           "alerts": {"enabled": True, "webhook_url": "http://hook"},
+           "safety": {"max_cleared_fraction": 0.5}}
+    assert editor.config_systems(raw) == {"campus": "bacnet", "sup": "niagara"}
+
+    form = editor.form_from_raw(raw, "campus", "bacnet")
+    assert form["systems.campus.local_address"] == "10.1.1.5/24"
+    form["systems.campus.local_address"] = "10.9.9.9/24"
+    out = editor.apply_config_form(raw, form, "campus", "bacnet")
+
+    assert out["systems"]["campus"]["local_address"] == "10.9.9.9/24"
+    # The system that wasn't on screen is untouched...
+    assert out["systems"]["sup"] == {"driver": "niagara", "host": "n4",
+                                     "port": 8443}, out["systems"]["sup"]
+    # ...and so is everything the form never shows.
+    assert out["retry"] == {"attempts": 5}
+    assert out["alerts"]["webhook_url"] == "http://hook"
+    assert out["safety"] == {"max_cleared_fraction": 0.5}
+
+
+def test_editor_config_form_shows_driver_specific_fields():
+    """A BACnet system must not be offered Niagara's ORD boxes."""
+    import editor
+    bacnet = {k for k, *_ in editor.system_config_fields("s", "bacnet")}
+    niagara = {k for k, *_ in editor.system_config_fields("s", "niagara")}
+    assert ("systems", "s", "local_address") in bacnet
+    assert ("systems", "s", "schedule_base_path") not in bacnet
+    assert ("systems", "s", "schedule_base_path") in niagara
+    assert ("systems", "s", "local_address") not in niagara
+    # An unrecognised driver contributes no fields rather than exploding.
+    assert editor.system_config_fields("s", "nonesuch") == []
+
+
+def test_editor_config_form_invalid_int_raises():
+    """A non-numeric port is reported against its label, not swallowed."""
+    import editor
+    form = editor.form_from_raw({}, "sup", "niagara")
+    form["systems.sup.port"] = "eight-thousand"
+    try:
+        editor.apply_config_form({}, form, "sup", "niagara")
+    except ValueError as exc:
+        assert "Port" in str(exc), exc
+        return
+    raise AssertionError("a non-numeric int should raise ValueError")
+
+
+def test_editor_floors_roundtrip():
+    """Floors survive the editor's dump -> load -> sync-loader path."""
+    import editor
+    buildings = [{"id": "b", "target": "B/Occ"}]
+    floors = [{"building": "b", "level": 3, "target": "B/F3_Corridor"}]
+    rooms = [{"space_id": 1, "building": "b", "floor": 3, "target": "B/Rm301"}]
+
+    def _check(path):
+        b2, f2, r2 = editor.load_mapping(path)
+        assert len(b2) == 1 and len(f2) == 1 and len(r2) == 1, (b2, f2, r2)
+        return load_space_map(path, base_config())
+
+    sm = with_yaml(editor.dump_mapping(buildings, floors, rooms), _check)
+    assert not sm.errors, sm.errors
+    assert sm.spaces["1"].floor_destination == dest("B/F3_Corridor")
+
+
+def test_editor_migrates_legacy_key_in_all_three_sections():
+    """A pre-1.0 map — buildings, floors and rooms — opens with every
+    niagara_path renamed to target."""
+    import editor
+    text = ("buildings:\n  - id: b\n    niagara_path: 'B/Occ'\n"
+            "floors:\n  - building: b\n    level: 1\n"
+            "    niagara_path: 'B/F1'\n"
+            "spaces:\n  - space_id: 1\n    niagara_path: 'B/Rm1'\n")
+    buildings, floors, rooms = with_yaml(text, editor.load_mapping)
+    for row in (buildings[0], floors[0], rooms[0]):
+        assert "niagara_path" not in row, row
+        assert row["target"].startswith("B/"), row
 
 
 def main() -> int:

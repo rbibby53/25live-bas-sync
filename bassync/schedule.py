@@ -5,12 +5,16 @@
 Turns raw 25Live space assignments into the set of occupancy windows each BAS
 schedule should hold.
 
+Occupancy rolls up in three tiers — room -> floor corridor -> building — so a
+single evening booking on the third floor conditions that room and its corridor
+without running the whole tower.
+
 Two merges happen, and the distinction matters when tuning:
 
   1. Within a space, using that space's own `merge_gap_minutes` — "don't cycle
      the box off for the twelve minutes between two back-to-back classes".
-  2. Across the spaces that feed a building roll-up, using the global default
-     gap — "the building is occupied whenever any of its rooms is".
+  2. Across the spaces feeding a roll-up (floor or building), using the global
+     default gap — "the corridor is occupied whenever any room off it is".
 """
 
 import logging
@@ -34,7 +38,9 @@ class ScheduleBuilder:
             by_space[ev.space_id].append(ev)
 
         result: dict = {}
-        building_windows: dict = defaultdict(list)
+        # Floor corridors and building roll-ups accumulate the same way, so
+        # they share one bucket keyed by Destination.
+        rollup_windows: dict = defaultdict(list)
 
         for space_id, evs in by_space.items():
             sc = spaces.get(space_id)
@@ -55,17 +61,18 @@ class ScheduleBuilder:
                 # first room's bookings and leave that half of the room cold.
                 self._accumulate(result, sc.destination, windows,
                                  sc.merge_gap_minutes)
-                if sc.building_destination:
-                    building_windows[sc.building_destination].extend(windows)
+                # The room feeds its floor corridor AND its building.
+                for dest in sc.rollup_destinations():
+                    rollup_windows[dest].extend(windows)
             elif sc.space_type == "building":
                 # A directly-booked common area (e.g. an atrium).
-                building_windows[sc.destination].extend(windows)
+                rollup_windows[sc.destination].extend(windows)
 
-        # Roll-ups: rooms plus any direct building bookings, merged across
+        # Roll-ups: rooms plus any direct common-area bookings, merged across
         # spaces with the global default gap. A room's own gap override shapes
         # the windows it contributes, so a room held "occupied" across a gap
-        # keeps its building occupied too.
-        for dest, windows in building_windows.items():
+        # keeps its corridor and building occupied too.
+        for dest, windows in rollup_windows.items():
             self._accumulate(result, dest, windows, self.default_merge_gap)
 
         total = sum(len(v) for v in result.values())

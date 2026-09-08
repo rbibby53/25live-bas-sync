@@ -6,13 +6,20 @@ Parses space_mapping.yaml — the cross-reference between 25Live spaces and BAS
 schedules.
 
     buildings:  each building's roll-up schedule, defined ONCE.
-    spaces:     the rooms; each room names the building it belongs to.
+    floors:     optional per-floor corridor schedules, keyed by building+level.
+    spaces:     the rooms; each room names the building (and optionally floor)
+                it belongs to.
 
 Every room that names a building is automatically unioned into that building's
 occupancy schedule, so if ANY room in the building is occupied the building
-schedule (hallways, lobbies, common AHUs) runs too. A room never repeats its
-building's target — it just names the building — which makes "all rooms in the
-building" the default and removes the chance of forgetting to wire one up.
+schedule (lobbies, common AHUs) runs too. A room never repeats its building's
+target — it just names the building — which makes "all rooms in the building"
+the default and removes the chance of forgetting to wire one up.
+
+A room that also names a `floor` feeds that floor's corridor schedule as well,
+so occupancy rolls up room -> floor -> building. That is what keeps a single
+evening booking on the third floor from conditioning the whole tower while
+still lighting and tempering the corridor someone has to walk down.
 
 Inheritance, all with the same precedence — room > building > global:
     pre_condition_minutes   HVAC run-up before a booking
@@ -24,8 +31,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import yaml
-
+from .config import ConfigError, read_yaml
 from .model import Destination, SpaceConfig
 
 
@@ -76,11 +82,12 @@ class SpaceMap:
     """The loaded room map, plus whatever was wrong with it."""
 
     def __init__(self, spaces: dict, errors: list, warnings: list,
-                 building_count: int = 0):
+                 building_count: int = 0, floor_count: int = 0):
         self.spaces = spaces              # { space_id: SpaceConfig }
         self.errors = errors              # fatal — the run should not proceed
         self.warnings = warnings          # worth saying, not worth stopping for
         self.building_count = building_count
+        self.floor_count = floor_count
 
     def __bool__(self) -> bool:
         return bool(self.spaces)
@@ -89,12 +96,18 @@ class SpaceMap:
         return len(self.spaces)
 
     def destinations(self) -> set:
-        """Every distinct schedule the sync would write — rooms and roll-ups."""
+        """
+        Every distinct schedule the sync manages — rooms, floor corridors and
+        building roll-ups.
+
+        This is the set that gets cleared when a space has no bookings, so a
+        roll-up missing from here is a schedule that would silently keep running
+        last week's occupancy forever.
+        """
         out = set()
         for sc in self.spaces.values():
             out.add(sc.destination)
-            if sc.building_destination:
-                out.add(sc.building_destination)
+            out.update(sc.rollup_destinations())
         return out
 
     def systems_used(self) -> set:
@@ -125,15 +138,11 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
         return SpaceMap({}, errors, warnings)
 
     try:
-        with open(p, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-    except yaml.YAMLError as exc:
-        errors.append(f"Room map {path} is not valid YAML: {exc}")
-        return SpaceMap({}, errors, warnings)
-
-    if not isinstance(data, dict):
-        errors.append(f"Room map {path} must be a mapping with `buildings:` "
-                      "and `spaces:` sections.")
+        data = read_yaml(p)
+    except ConfigError as exc:
+        # Reported rather than raised: --validate should list every problem it
+        # can find in one pass, not stop at the first.
+        errors.append(f"Room map {exc}")
         return SpaceMap({}, errors, warnings)
 
     # ── 1) Index the building definitions by id ──────────────────────────────
@@ -162,6 +171,56 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
                     f"{', '.join(sorted(known_systems)) or '(none)'}.")
             else:
                 building_dest[bid] = Destination(system=system, target=target)
+
+    # ── 1b) Index floor corridor schedules by (building id, level) ───────────
+    floor_dest: dict = {}
+    for f in (data.get("floors") or []):
+        if not isinstance(f, dict):
+            errors.append(f"A floors: entry is not a mapping: {f!r}")
+            continue
+        raw_building = f.get("building")
+        raw_level = f.get("level")
+        if raw_building in (None, "") or raw_level in (None, ""):
+            errors.append(
+                f"Floor entry {f!r} needs both `building:` and `level:`.")
+            continue
+        building_id = str(raw_building)
+        try:
+            level = int(raw_level)
+        except (TypeError, ValueError):
+            errors.append(
+                f"Floor entry for building '{building_id}' has a non-numeric "
+                f"level {raw_level!r}.")
+            continue
+        if building_id not in buildings:
+            errors.append(
+                f"Floor {level} references unknown building '{building_id}'.")
+            continue
+
+        target = _target_of(f, "Floor", f"{building_id} level {level}", errors)
+        if target is None:
+            continue
+        # A floor inherits its building's system unless it says otherwise —
+        # a corridor is served by the same panel as the rooms off it far more
+        # often than not.
+        bld = buildings[building_id]
+        system = str(_resolve(f.get("system"), bld.get("system"),
+                              default_system) or "")
+        if not system:
+            errors.append(
+                f"Floor {level} of '{building_id}': no `system:` and no default.")
+            continue
+        if known_systems and system not in known_systems:
+            errors.append(
+                f"Floor {level} of '{building_id}': system '{system}' is not "
+                f"defined under `systems:` in config.yaml.")
+            continue
+        key = (building_id, level)
+        if key in floor_dest:
+            errors.append(
+                f"Floor {level} of building '{building_id}' is defined twice.")
+            continue
+        floor_dest[key] = Destination(system=system, target=target)
 
     space_map: dict = {}
 
@@ -198,6 +257,32 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
             else:
                 bdest = building_dest.get(building_id)
 
+        # Optional per-floor corridor schedule (room -> floor -> building).
+        # Only meaningful for a room that belongs to a building, since floors
+        # are keyed by building.
+        floor = None
+        fdest = None
+        if row.get("floor") not in (None, ""):
+            try:
+                floor = int(row["floor"])
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"Room {space_id} has a non-numeric floor "
+                    f"{row['floor']!r} — ignoring it.")
+            if floor is not None:
+                if building_id in (None, ""):
+                    warnings.append(
+                        f"Room {space_id} names floor {floor} but no building, "
+                        "so there is nothing to look the floor up against — it "
+                        "will NOT drive a corridor schedule.")
+                else:
+                    fdest = floor_dest.get((str(building_id), floor))
+                    if fdest is None:
+                        warnings.append(
+                            f"Room {space_id} references floor {floor} of "
+                            f"building '{building_id}' with no matching floors: "
+                            "entry — it will NOT drive a corridor schedule.")
+
         bld = building or {}
         system = str(_resolve(row.get("system"), bld.get("system"),
                               default_system) or "")
@@ -227,6 +312,8 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
                 bld.get("post_buffer_minutes"), default_post)),
             merge_gap_minutes=_int_or_default(
                 row.get("merge_gap_minutes"), default_gap),
+            floor=floor,
+            floor_destination=fdest,
         ), f"room {row.get('space_name', space_id)}")
 
     # ── 3) Buildings that are themselves bookable in 25Live ──────────────────
@@ -271,8 +358,9 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
                 "intended for a divisible room, a mistake otherwise.")
 
     n_rooms = sum(1 for s in space_map.values() if s.space_type == "room")
-    logging.info("Loaded %d rooms across %d buildings from %s",
-                 n_rooms, len(buildings), path)
+    logging.info("Loaded %d rooms across %d buildings (%d floor schedules) from %s",
+                 n_rooms, len(buildings), len(floor_dest), path)
     for w in warnings:
         logging.warning("%s", w)
-    return SpaceMap(space_map, errors, warnings, building_count=len(buildings))
+    return SpaceMap(space_map, errors, warnings,
+                    building_count=len(buildings), floor_count=len(floor_dest))

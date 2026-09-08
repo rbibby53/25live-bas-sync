@@ -121,6 +121,36 @@ def default_state_file() -> str:
     return str(PROJECT_ROOT / "logs" / "last_run.json")
 
 
+class ConfigError(Exception):
+    """A YAML file (config / defaults / room map) is unreadable, malformed, or
+    not a mapping. Carries a human-readable, file-named message so callers can
+    report one clean line instead of a raw traceback."""
+
+
+def read_yaml(path) -> dict:
+    """
+    Load a YAML file into a dict. A missing or empty file yields {}. A parse
+    error, an unreadable file, or a top level that isn't a mapping raises
+    ConfigError naming the file — so a stray tab in config.yaml fails with one
+    clear line instead of a stack trace at 2 AM.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+    except (yaml.YAMLError, OSError) as exc:
+        raise ConfigError(f"{p}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"{p}: expected a YAML mapping at the top level, got "
+            f"{type(data).__name__}.")
+    return data
+
+
 def _deep_merge(base: dict, override: dict) -> None:
     """Recursively merge `override` into `base` in place (nested dicts merged,
     scalars/lists replaced)."""
@@ -201,19 +231,18 @@ def load_config(path: str, defaults_path: Optional[str] = None) -> dict:
     Build the runtime config: a deep copy of DEFAULTS, with config.yaml merged
     over it, then defaults.yaml applied on top of the scheduling knobs.
 
-    A missing file just leaves the built-ins in place. Secrets are applied
-    separately by load_credentials().
+    A missing file just leaves the built-ins in place. Raises ConfigError if a
+    file exists but is unreadable or malformed — better a clean refusal than a
+    run that silently falls back to defaults and writes the wrong schedules.
+    Secrets are applied separately by load_credentials().
     """
     cfg = copy.deepcopy(DEFAULTS)
-    p = Path(path)
-    if p.exists():
-        with open(p, "r", encoding="utf-8") as fh:
-            user = yaml.safe_load(fh) or {}
+    user = read_yaml(path)
+    if user:
         _deep_merge(cfg, user)
 
-    if defaults_path and Path(defaults_path).exists():
-        with open(defaults_path, "r", encoding="utf-8") as fh:
-            gd = yaml.safe_load(fh) or {}
+    if defaults_path:
+        gd = read_yaml(defaults_path)
         for file_key, cfg_key in DEFAULTS_FILE_MAP.items():
             if gd.get(file_key) is not None:
                 cfg["collegenet"][cfg_key] = gd[file_key]

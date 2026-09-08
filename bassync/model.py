@@ -90,9 +90,20 @@ class SpaceConfig:
     space_name: str
     space_type: str                          # "room" or "building"
     destination: Destination                 # this space's own schedule
-    building_destination: Optional[Destination]  # roll-up schedule, if any
+    building_destination: Optional[Destination]  # building roll-up, if any
     pre_condition_minutes: int
     post_buffer_minutes: int
     merge_gap_minutes: int                   # collapse this space's own windows
                                              # within this gap; falls back to the
                                              # global default
+    floor: Optional[int] = None              # which floor the room is on
+    floor_destination: Optional[Destination] = None
+    # The floor's hallway schedule this room also feeds. A room drives its own
+    # zone, its floor's corridor, AND its building's common areas — so a single
+    # evening booking on the third floor lights and conditions that corridor
+    # without running the whole tower.
+
+    def rollup_destinations(self) -> list:
+        """Every roll-up schedule this space contributes to, nearest first."""
+        return [d for d in (self.floor_destination, self.building_destination)
+                if d is not None]

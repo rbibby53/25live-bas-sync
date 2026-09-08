@@ -60,8 +60,8 @@ if sys.version_info < MIN_PYTHON:
         "is dependencies installed for one Python and the job running another.")
 
 from bassync import __version__          # noqa: E402 — must follow the check
-from bassync.config import (default_log_file, load_config, load_credentials,
-                            resolve_default_system)
+from bassync.config import (ConfigError, default_log_file, load_config,
+                            load_credentials, resolve_default_system)
 from bassync.drivers import driver_names, load_driver_class
 from bassync.notify import send_alert
 from bassync.sync import (EXIT_CODE_HELP, EXIT_ERROR, EXIT_OK,
@@ -148,7 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Path to config.yaml (default: ./config.yaml, or $BAS_CONFIG)")
     parser.add_argument("--defaults",
                         help="Path to defaults.yaml (default: ./defaults.yaml, or $BAS_DEFAULTS)")
-    parser.add_argument("--space-map", help="Override the path to space_mapping.yaml")
+    parser.add_argument("--space-map",
+                        help="Override the path to space_mapping.yaml "
+                             "(or set $BAS_SPACE_MAP)")
 
     mode = parser.add_argument_group("modes (default: live sync)")
     mode.add_argument("--dry-run", action="store_true",
@@ -190,10 +192,21 @@ def main(argv=None) -> int:
                 or str(PROJECT_DIR / "config.yaml"))
     defaults_path = (args.defaults or os.environ.get("BAS_DEFAULTS")
                      or str(PROJECT_DIR / "defaults.yaml"))
-    cfg = load_config(cfg_path, defaults_path)
+    try:
+        cfg = load_config(cfg_path, defaults_path)
+    except ConfigError as exc:
+        # Logging isn't up yet; bring it up on the default path so this fatal
+        # startup error still reaches the log a scheduled task leaves behind,
+        # then exit cleanly rather than with a traceback.
+        setup_logging(default_log_file())
+        logging.error("Configuration error — %s", exc)
+        return EXIT_ERROR
 
-    if args.space_map:
-        cfg["space_map_file"] = args.space_map
+    # $BAS_SPACE_MAP lets the Docker image point at a mounted room map without
+    # rewriting the command line.
+    space_map_path = args.space_map or os.environ.get("BAS_SPACE_MAP")
+    if space_map_path:
+        cfg["space_map_file"] = space_map_path
     if cfg["log_file"] is None:
         cfg["log_file"] = default_log_file()
 

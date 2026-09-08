@@ -186,18 +186,40 @@ Each entry also carries:
 
 `space_mapping.example.yaml` documents every field.
 
+**Per-floor hallway HVAC.** For buildings controlled per floor, add a `floors:`
+section (each floor = its `building`, a numeric `level`, and a hallway
+`niagara_path`) and give each room a `floor:`. A room then drives its floor's
+hallway schedule too, and floors roll up into the building (**room → floor →
+building**): a floor hallway runs if any room on it is booked, and the building
+runs if any floor is. The editor has a **Floors** tab and a per-room floor field.
+
 ### Editing rooms with the GUI
 
 Run `python editor.py` (Windows users can double-click `Edit-Rooms.bat`):
 
-- **Rooms** tab — Add/Edit/Delete rooms. **Building** and **System** are
-  dropdowns fed from your map and `config.yaml`, so joining a roll-up or moving
-  a room to another BAS is a pick from a list.
+- **Rooms** tab — Add/Edit/Delete rooms. **Building**, **Floor** and **System**
+  are dropdowns, so joining a roll-up or moving a room to another BAS is a pick
+  from a list rather than something to remember.
 - **Buildings** tab — manage roll-up schedules; renaming a building id repoints
-  the rooms that referenced it.
-- **Defaults** tab — the global run-up/run-down/merge-gap/lookahead values.
-- **Tools** menu — *Test 25Live connection*, *Test BAS connections* (health-checks
-  every system and reports them all), and *Preview (dry run)*.
+  the rooms and floors that referenced it.
+- **Floors** tab — per-floor corridor schedules (building + floor # + target).
+- **Connection** tab — edit `config.yaml` in the editor: the 25Live
+  instance/account, your BAS systems, and the timezone. Pick a system from the
+  dropdown and the fields follow its driver, so a BACnet system shows a NIC
+  address and BBMD while a Niagara one shows host/port/ORDs. **Add…** creates a
+  new system. Passwords are never stored here — they stay in the `BAS_*`
+  environment variables — and sections you don't see (`retry`, `alerts`,
+  `safety`) are preserved on save.
+- **Defaults** tab — the global run-up/run-down/merge-gap/lookahead values
+  (saved to `defaults.yaml`).
+- **Tools** menu — *Test 25Live connection*, *Test BAS connections*
+  (health-checks every configured system and reports them all, so "BACnet is
+  fine, the supervisor is down" is the answer you get), and *Preview (dry run)*.
+
+Every table has live search, click-to-sort headers, and a Duplicate action, and
+the whole window **follows your OS light/dark setting** automatically. One Save
+(Ctrl+S) writes the room map, connection settings, and defaults together — a
+single place to configure everything.
 
 It validates required fields and duplicate IDs, warns on missing-building
 references, and keeps a `.bak` of the previous version on save.
@@ -267,6 +289,60 @@ Set the `BAS_*` env vars for the account that runs the task.
 
 Logs default to `logs/25live_sync.log` (override with `log_file`); if that
 directory isn't writable the script logs to stdout instead.
+
+## Run with Docker
+
+A `Dockerfile` and `docker-compose.yml` are included for running the **sync**
+headlessly in a container. (The Tkinter editor isn't containerized — edit your
+YAML on a workstation, then mount it in.)
+
+> **BACnet needs host networking.** The BACnet driver binds a real NIC address
+> and relies on broadcast, neither of which survives Docker's default bridge.
+> Run it with `network_mode: host` (already set in the compose file) and set
+> `local_address` to the *host's* address. On Docker Desktop for Mac/Windows,
+> host networking is limited — run the BACnet path directly on a Linux host or
+> a VM on the controls network. The `niagara` and `rest` drivers are ordinary
+> HTTP and work fine under bridge networking.
+
+**1. Put your config where the container can mount it.** Create a `config/`
+folder holding `config.yaml`, `defaults.yaml`, and `space_mapping.yaml` (copy the
+`.example` files). **2. Put secrets in `.env`** (copy `.env.example`) — it's
+gitignored and loaded automatically by compose:
+
+```bash
+mkdir -p config && cp config.example.yaml config/config.yaml   # + defaults / space_mapping
+cp .env.example .env                                            # then fill in passwords
+```
+
+```bash
+docker compose run --rm -e SYNC_AT= sync --validate   # one-shot pre-flight (no writes)
+docker compose run --rm -e SYNC_AT= sync --dry-run    # one-shot, fetch + build only
+docker compose up -d                                  # self-scheduling nightly sync
+docker compose logs -f                                # watch it
+```
+
+Two ways to run it:
+
+- **Self-scheduling (default).** `docker compose up -d` keeps the container up and
+  runs the sync once a day at `SYNC_AT` (default `02:00`, in `TZ`). No host cron
+  needed. Set `SYNC_ON_START=1` to also run once on startup.
+- **One-shot.** Clearing `SYNC_AT` makes the container run once and exit with the
+  sync's exit code — ideal for host cron, CI, or a **Kubernetes CronJob**:
+
+  ```bash
+  docker run --rm --network host \
+    -e BAS_25LIVE_PASSWORD=... -e BAS_SYS_SUPERVISOR_PASSWORD=... \
+    -e TZ=America/New_York \
+    -v "$(pwd)/config:/config:ro" \
+    25live-bas-sync --validate
+  ```
+
+Anything after the image name is passed straight to `main.py` (`--validate`,
+`--dry-run`, `--discover`, `--test-alert`, …). Passwords come from the
+environment only and are never baked into the image; logs go to
+`docker compose logs` (and to the mounted `./logs` if present). The container
+points at `/config/*.yaml` via the `BAS_CONFIG` / `BAS_DEFAULTS` /
+`BAS_SPACE_MAP` env vars.
 
 ## Safety rails
 
@@ -442,7 +518,7 @@ for validating behavior against your own 25Live instance and your own BAS.
 | `main.py` | CLI entry point. |
 | `bassync/` | The sync engine (importable, unit-tested). |
 | `bassync/drivers/` | BAS integrations — `bacnet`, `niagara`, `rest`, `preview`. |
-| `editor.py` | GUI to add/edit rooms & buildings (Tkinter). |
+| `editor.py` | GUI to add/edit rooms, floors, buildings and connections (Tkinter). |
 | `Edit-Rooms.bat` | Double-click launcher for the editor (Windows). |
 | `config.example.yaml` | Connection/system template → copy to `config.yaml`. |
 | `defaults.example.yaml` | Scheduling defaults → copy to `defaults.yaml`. |
@@ -450,4 +526,9 @@ for validating behavior against your own 25Live instance and your own BAS.
 | `requirements.txt` | Core dependencies. |
 | `requirements-bacnet.txt` | Extra dependency for the BACnet driver. |
 | `Test.py` | Offline test suite. |
+| `Dockerfile` | Container image for the headless sync. |
+| `docker-compose.yml` | Compose service (scheduled or one-shot runs). |
+| `docker-entrypoint.sh` | One-shot by default; optional built-in scheduler. |
+| `.env.example` | Docker secrets template → copy to `.env`. |
 | `CONTRIBUTING.md` · `CHANGELOG.md` · `LICENSE` | |
+| `.github/workflows/ci.yml` | CI: offline tests on Python 3.11–3.14, with and without BACpypes3. |

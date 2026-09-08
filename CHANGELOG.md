@@ -31,6 +31,20 @@ working untouched — see *Upgrading* at the end.
 - **`systems:` config block** and per-space `system:` / `target:` keys, so a
   mixed campus syncs in one run. Rooms inherit their building's system
   (precedence room > building > `default_system`).
+- **Per-floor corridors work across vendors.** The `floors:` section from RC1
+  now carries `system:` too and inherits from its building, so a part-finished
+  retrofit can leave a corridor on the supervisor while its rooms move to
+  BACnet. Floor schedules also join the managed set, so a corridor with no
+  bookings is actively cleared instead of holding last week's occupancy.
+- **Editor Connection tab is driver-aware.** Pick a system from the dropdown and
+  the fields follow its driver — NIC address and BBMD for BACnet, host/port/ORDs
+  for Niagara — with **Add…** to create one. Systems you aren't looking at, and
+  config sections the form never shows (`retry`, `alerts`, `safety`), survive a
+  save untouched.
+- **Docker image carries the BACnet driver** and documents the host-networking
+  requirement: BACnet binds a real NIC and needs broadcast, neither of which
+  survives the default bridge. `.env` is passed through wholesale so per-system
+  `BAS_SYS_<NAME>_PASSWORD` variables reach the container.
 - **Mass-clear safety rails** (`safety:`). A run refuses to write if 25Live
   returned fewer than `min_events` assignments, or if more than
   `max_cleared_fraction` of previously-occupied schedules would be emptied at
@@ -118,6 +132,26 @@ Run `--validate` and `--dry-run` first, as always.
 ## [V1.0 RC1] and earlier pre-releases
 
 ### Added
+- **Docker support.** A `Dockerfile`, `docker-compose.yml`, and entrypoint run
+  the headless sync in a container. One-shot by default (pass `--validate` /
+  `--dry-run` straight through; ideal for host cron or a k8s CronJob) with an
+  optional built-in daily scheduler (`SYNC_AT=HH:MM`) so `docker compose up -d`
+  is a self-contained nightly sync. Secrets stay in the environment / a
+  gitignored `.env`; config is mounted at `/config`. New `BAS_SPACE_MAP` env var
+  (parallel to `BAS_CONFIG` / `BAS_DEFAULTS`) points the sync at its room map.
+- **Editor: Connection tab + auto theme.** The GUI now edits `config.yaml`
+  (25Live, Niagara, timezone) directly, so it's a one-stop shop — one Save writes
+  the room map, connection settings, and defaults together. Passwords stay in env
+  vars and unexposed sections (`retry`, `alerts`) are preserved. The window also
+  follows the OS light/dark appearance.
+- **Editor: usability pass.** Per-table live search, click-to-sort columns,
+  vertical scrollbars, a Duplicate action, a right-click context menu, keyboard
+  shortcuts (Enter to edit, Del to delete), a status bar with live counts, and
+  tab labels that show item counts.
+- **Per-floor hallway HVAC.** Optional `floors:` section (building + level +
+  niagara_path) and a per-room `floor:`. A room drives its floor's hallway
+  schedule, and floors roll up into the building (room → floor → building). New
+  **Floors** tab and per-room floor field in the editor.
 - **`defaults.yaml`** — global scheduling defaults (run-up, run-down, merge-gap,
   lookahead) split into their own operator-tunable file, with a **Defaults** tab
   in the editor and a `--defaults` flag. Connection/auth settings stay in
