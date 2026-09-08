@@ -1,36 +1,47 @@
 #!/usr/bin/env python3
 """
-Offline tests for the pure logic in main.py — no 25Live or Niagara needed.
+Offline tests — no 25Live, no BAS, no network.
 
-Covers:
-  - ScheduleBuilder: event merging + building roll-up.
-  - load_space_map: rooms auto-union into their building's schedule.
+Covers the parts where a bug is expensive and silent: the merge/roll-up logic,
+the room map loader and its inheritance rules, the BACnet exception-schedule
+encoding, the mass-clear safety rail, and the editor's YAML round-trip.
 
 Run with:
     python Test.py
 """
 
 import os
+import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from main import (
-    RawEvent, SpaceConfig, ScheduleBuilder, OccupancyWindow,
-    load_space_map, CONFIG,
-)
+from bassync.config import load_config, migrate_legacy_systems, resolve_default_system
+from bassync.model import Destination, OccupancyWindow, RawEvent, SpaceConfig
+from bassync.schedule import ScheduleBuilder
+from bassync.spacemap import load_space_map
 
 TZ = ZoneInfo("America/New_York")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def dt(hour: int, minute: int = 0, day: int = 1) -> datetime:
     return datetime(2026, 6, day, hour, minute, tzinfo=TZ)
 
 
-def space(space_id, ntype, niagara_path, building=None, merge_gap=5) -> SpaceConfig:
+def dest(target: str, system: str = "sys") -> Destination:
+    return Destination(system=system, target=target)
+
+
+def space(space_id, kind, target, building=None, merge_gap=5,
+          system="sys") -> SpaceConfig:
     return SpaceConfig(
-        space_id=str(space_id), space_name=str(space_id), space_type=ntype,
-        niagara_path=niagara_path, building_schedule_path=building,
+        space_id=str(space_id), space_name=str(space_id), space_type=kind,
+        destination=dest(target, system),
+        building_destination=dest(building, system) if building else None,
         pre_condition_minutes=0, post_buffer_minutes=0,
         merge_gap_minutes=merge_gap,
     )
@@ -41,344 +52,753 @@ def event(space_id, start, end, eid="E1") -> RawEvent:
                     start=start, end=end)
 
 
+def with_yaml(text: str, fn):
+    """Run fn(path) against a temp YAML file, always cleaning up."""
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        fh.write(text)
+        path = fh.name
+    try:
+        return fn(path)
+    finally:
+        os.unlink(path)
+
+
+def base_config(**overrides) -> dict:
+    cfg = load_config("/nonexistent/config.yaml")
+    cfg["systems"] = {"sys": {"driver": "preview"}}
+    cfg["default_system"] = "sys"
+    cfg.update(overrides)
+    return cfg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# merging + building roll-up
+# ─────────────────────────────────────────────────────────────────────────────
+
 def test_adjacent_events_merge():
     """Two back-to-back events (within the gap) collapse into one window."""
-    builder = ScheduleBuilder(default_merge_gap_minutes=5)
-    space_map = {"1": space(1, "room", "Bldg/Rm1")}
-    events = [
-        event(1, dt(9), dt(10)),
-        event(1, dt(10, 3), dt(11)),   # 3-min gap < 5-min merge gap
-    ]
-    result = builder.build(events, space_map)
-    windows = result["Bldg/Rm1"]
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10)), event(1, dt(10, 3), dt(11))],
+        {"1": space(1, "room", "Bldg/Rm1")})
+    windows = result[dest("Bldg/Rm1")]
     assert len(windows) == 1, windows
     assert windows[0].start == dt(9) and windows[0].end == dt(11), windows[0]
 
 
 def test_separated_events_stay_split():
     """Events further apart than the gap remain two windows."""
-    builder = ScheduleBuilder(default_merge_gap_minutes=5)
-    space_map = {"1": space(1, "room", "Bldg/Rm1")}
-    events = [
-        event(1, dt(9), dt(10)),
-        event(1, dt(11), dt(12)),      # 1-hour gap
-    ]
-    result = builder.build(events, space_map)
-    assert len(result["Bldg/Rm1"]) == 2, result["Bldg/Rm1"]
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10)), event(1, dt(11), dt(12))],
+        {"1": space(1, "room", "Bldg/Rm1")})
+    assert len(result[dest("Bldg/Rm1")]) == 2
 
 
 def test_building_rollup_unions_rooms():
-    """Two rooms feeding one building schedule produce a merged building window."""
-    builder = ScheduleBuilder(default_merge_gap_minutes=5)
+    """Two rooms feeding one building schedule produce a merged window."""
     space_map = {
-        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Building_Occ"),
-        "2": space(2, "room", "Bldg/Rm2", building="Bldg/Building_Occ"),
+        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Occ"),
+        "2": space(2, "room", "Bldg/Rm2", building="Bldg/Occ"),
     }
-    events = [
-        event(1, dt(9), dt(10), "E1"),    # room 1: 09-10
-        event(2, dt(10), dt(11), "E2"),   # room 2: 10-11 (adjacent to room 1)
-    ]
-    result = builder.build(events, space_map)
-    # Each room keeps its own window...
-    assert len(result["Bldg/Rm1"]) == 1
-    assert len(result["Bldg/Rm2"]) == 1
-    # ...and the building rolls both up into a single 09-11 window.
-    bwin = result["Bldg/Building_Occ"]
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10), "E1"), event(2, dt(10), dt(11), "E2")], space_map)
+    assert len(result[dest("Bldg/Rm1")]) == 1
+    assert len(result[dest("Bldg/Rm2")]) == 1
+    bwin = result[dest("Bldg/Occ")]
     assert len(bwin) == 1, bwin
     assert bwin[0].start == dt(9) and bwin[0].end == dt(11), bwin[0]
 
 
 def test_disjoint_rooms_give_building_two_windows():
-    """If two rooms are occupied at different times, the building is occupied
-    for BOTH windows (union, not just overlap)."""
-    builder = ScheduleBuilder(default_merge_gap_minutes=5)
+    """Rooms occupied at different times leave the building occupied for BOTH
+    windows (a union, not an intersection)."""
     space_map = {
-        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Building_Occ"),
-        "2": space(2, "room", "Bldg/Rm2", building="Bldg/Building_Occ"),
+        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Occ"),
+        "2": space(2, "room", "Bldg/Rm2", building="Bldg/Occ"),
     }
-    events = [
-        event(1, dt(9), dt(10), "E1"),     # morning booking in room 1
-        event(2, dt(14), dt(15), "E2"),    # afternoon booking in room 2
-    ]
-    result = builder.build(events, space_map)
-    bwin = result["Bldg/Building_Occ"]
-    assert len(bwin) == 2, bwin
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10), "E1"), event(2, dt(14), dt(15), "E2")], space_map)
+    assert len(result[dest("Bldg/Occ")]) == 2
 
 
 def test_per_room_merge_gap_overrides_default():
-    """A room with a wide merge_gap_minutes collapses windows that the global
-    default would have kept separate."""
-    builder = ScheduleBuilder(default_merge_gap_minutes=5)
+    """A room with a wide merge_gap collapses windows the global default keeps
+    separate."""
     space_map = {
-        "1": space(1, "room", "Bldg/Rm1", merge_gap=30),   # wide gap
-        "2": space(2, "room", "Bldg/Rm2", merge_gap=5),    # default gap
+        "1": space(1, "room", "Bldg/Rm1", merge_gap=30),
+        "2": space(2, "room", "Bldg/Rm2", merge_gap=5),
     }
-    # 20-minute gap between the two bookings in each room.
-    events = [
-        event(1, dt(9), dt(10), "A1"), event(1, dt(10, 20), dt(11), "A2"),
-        event(2, dt(9), dt(10), "B1"), event(2, dt(10, 20), dt(11), "B2"),
-    ]
-    result = builder.build(events, space_map)
-    assert len(result["Bldg/Rm1"]) == 1, result["Bldg/Rm1"]   # merged (30 >= 20)
-    assert len(result["Bldg/Rm2"]) == 2, result["Bldg/Rm2"]   # split  (5 < 20)
-
-
-def test_room_gap_carries_into_building_contribution():
-    """A room's own wide gap merges its windows, and that merged occupancy
-    carries into the building (the building reflects when the room is occupied)."""
-    builder = ScheduleBuilder(default_merge_gap_minutes=5)
-    space_map = {
-        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Building_Occ", merge_gap=30),
-    }
-    # Two bookings 20 min apart. Room gap 30 merges them into 09-11, and the
-    # building inherits that single window.
-    events = [
-        event(1, dt(9), dt(10), "A1"),
-        event(1, dt(10, 20), dt(11), "A2"),
-    ]
-    result = builder.build(events, space_map)
-    assert len(result["Bldg/Rm1"]) == 1, result["Bldg/Rm1"]
-    assert len(result["Bldg/Building_Occ"]) == 1, result["Bldg/Building_Occ"]
+    events = [event(1, dt(9), dt(10), "A1"), event(1, dt(10, 20), dt(11), "A2"),
+              event(2, dt(9), dt(10), "B1"), event(2, dt(10, 20), dt(11), "B2")]
+    result = ScheduleBuilder(5).build(events, space_map)
+    assert len(result[dest("Bldg/Rm1")]) == 1, result[dest("Bldg/Rm1")]
+    assert len(result[dest("Bldg/Rm2")]) == 2, result[dest("Bldg/Rm2")]
 
 
 def test_cross_room_building_merge_uses_default_gap():
     """Merging windows from DIFFERENT rooms into the building uses the global
-    default gap, regardless of either room's own gap override."""
+    default gap, regardless of either room's own override."""
     space_map = {
-        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Building_Occ", merge_gap=30),
-        "2": space(2, "room", "Bldg/Rm2", building="Bldg/Building_Occ", merge_gap=30),
+        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Occ", merge_gap=30),
+        "2": space(2, "room", "Bldg/Rm2", building="Bldg/Occ", merge_gap=30),
     }
-    # Room 1 occupied 09-10, room 2 occupied 10:20-11 — 20 min apart, in two
-    # different rooms (each a single event, so no intra-room merge happens).
     events = [event(1, dt(9), dt(10), "A"), event(2, dt(10, 20), dt(11), "B")]
-
-    # Default gap 5: the 20-min cross-room gap is NOT bridged -> two windows.
-    r_tight = ScheduleBuilder(default_merge_gap_minutes=5).build(events, space_map)
-    assert len(r_tight["Bldg/Building_Occ"]) == 2, r_tight["Bldg/Building_Occ"]
-
-    # Default gap 30: now the building bridges the cross-room gap -> one window.
-    r_wide = ScheduleBuilder(default_merge_gap_minutes=30).build(events, space_map)
-    assert len(r_wide["Bldg/Building_Occ"]) == 1, r_wide["Bldg/Building_Occ"]
+    tight = ScheduleBuilder(5).build(events, space_map)
+    assert len(tight[dest("Bldg/Occ")]) == 2, tight[dest("Bldg/Occ")]
+    wide = ScheduleBuilder(30).build(events, space_map)
+    assert len(wide[dest("Bldg/Occ")]) == 1, wide[dest("Bldg/Occ")]
 
 
-def test_loader_reads_per_room_merge_gap():
-    """load_space_map picks up merge_gap_minutes per room, else the default."""
-    yaml_text = """
-buildings:
-  - id: b
-    niagara_path: "B/Building_Occ"
-spaces:
-  - space_id: 1
-    niagara_path: "B/Rm1"
-    merge_gap_minutes: 25
-  - space_id: 2
-    niagara_path: "B/Rm2"
-"""
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(yaml_text)
-        path = fh.name
-    try:
-        space_map = load_space_map(path, CONFIG)
-    finally:
-        os.unlink(path)
-    assert space_map["1"].merge_gap_minutes == 25
-    # Room 2 has no override -> falls back to the global default.
-    assert space_map["2"].merge_gap_minutes == CONFIG["collegenet"]["merge_gap_minutes"]
+def test_two_rooms_sharing_one_target_are_unioned():
+    """A divisible room mapped as two 25Live spaces onto ONE schedule keeps
+    both halves' bookings. Regression: the old builder assigned rather than
+    unioned, so whichever room was processed second silently erased the first
+    and half the room never got conditioned."""
+    space_map = {
+        "1": space(1, "room", "Bldg/Rm100"),
+        "2": space(2, "room", "Bldg/Rm100"),
+    }
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10), "A"), event(2, dt(14), dt(15), "B")], space_map)
+    windows = result[dest("Bldg/Rm100")]
+    assert len(windows) == 2, windows
+    assert {w.start for w in windows} == {dt(9), dt(14)}, windows
 
 
-def test_loader_preserves_explicit_zero_buffers():
-    """An explicit 0 for pre/post/merge_gap must be honored, not replaced by the
-    default (regression for the `value or default` coalescing bug)."""
-    yaml_text = """
-buildings: []
-spaces:
-  - space_id: 1
-    niagara_path: "B/Rm1"
-    pre_condition_minutes: 0
-    post_buffer_minutes: 0
-    merge_gap_minutes: 0
-"""
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(yaml_text)
-        path = fh.name
-    try:
-        space_map = load_space_map(path, CONFIG)
-    finally:
-        os.unlink(path)
-    s = space_map["1"]
-    assert s.pre_condition_minutes == 0, s.pre_condition_minutes
-    assert s.post_buffer_minutes == 0, s.post_buffer_minutes
-    assert s.merge_gap_minutes == 0, s.merge_gap_minutes
+def test_builder_skips_unmapped_space():
+    """An event for a space that isn't in the map can't take the run down."""
+    result = ScheduleBuilder(5).build([event(99, dt(9), dt(10))],
+                                      {"1": space(1, "room", "Bldg/Rm1")})
+    assert result == {}, result
 
 
-def test_naive_25live_datetime_uses_configured_tz():
-    """A naive 25Live timestamp is interpreted in the configured timezone, not
-    the server's local tz (regression for .astimezone() on a naive datetime)."""
-    import main
-    cn = main.CollegeNetClient(main.CONFIG["collegenet"], TZ)
-    d = cn._to_tz("2026-06-10T09:00:00")   # naive (no offset)
-    assert d.tzinfo is not None
-    # 09:00 is treated as 09:00 Eastern — wall-clock preserved, tz attached.
-    assert (d.hour, d.minute) == (9, 0), d
-    assert d.utcoffset() is not None
-
-
-def test_building_runup_overrides_global_but_not_room():
-    """Run-up/run-down precedence: room override > building override > global."""
-    yaml_text = """
-buildings:
-  - id: b
-    niagara_path: "B/Bldg"
-    pre_condition_minutes: 50
-    post_buffer_minutes: 20
-spaces:
-  - space_id: 1
-    building: b
-    niagara_path: "B/Rm1"
-  - space_id: 2
-    building: b
-    niagara_path: "B/Rm2"
-    pre_condition_minutes: 5
-  - space_id: 3
-    niagara_path: "B/Rm3"
-"""
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(yaml_text)
-        path = fh.name
-    try:
-        sm = load_space_map(path, CONFIG)
-    finally:
-        os.unlink(path)
-
-    # Room 1: no overrides -> inherits the BUILDING values (not global).
-    assert sm["1"].pre_condition_minutes == 50, sm["1"].pre_condition_minutes
-    assert sm["1"].post_buffer_minutes == 20, sm["1"].post_buffer_minutes
-    # Room 2: sets pre (beats building); post falls back to the building value.
-    assert sm["2"].pre_condition_minutes == 5, sm["2"].pre_condition_minutes
-    assert sm["2"].post_buffer_minutes == 20, sm["2"].post_buffer_minutes
-    # Room 3: no building -> GLOBAL defaults.
-    assert sm["3"].pre_condition_minutes == CONFIG["collegenet"]["default_pre_condition_minutes"]
-    assert sm["3"].post_buffer_minutes == CONFIG["collegenet"]["default_post_buffer_minutes"]
+def test_direct_building_booking_joins_rollup():
+    """A bookable common area's own events land on the building schedule
+    alongside the rooms that roll up into it."""
+    space_map = {
+        "1": space(1, "room", "Bldg/Rm1", building="Bldg/Occ"),
+        "9": space(9, "building", "Bldg/Occ"),
+    }
+    result = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10), "R"), event(9, dt(13), dt(14), "A")], space_map)
+    assert len(result[dest("Bldg/Occ")]) == 2, result[dest("Bldg/Occ")]
 
 
 def test_overlap_helper():
     """Sanity-check the OccupancyWindow overlap primitive directly."""
     a = OccupancyWindow(dt(9), dt(10))
-    b = OccupancyWindow(dt(10, 4), dt(11))   # 4-min gap
+    b = OccupancyWindow(dt(10, 4), dt(11))
     assert a.overlaps_or_adjacent(b, gap_minutes=5)
     assert not a.overlaps_or_adjacent(b, gap_minutes=3)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# room map loader
+# ─────────────────────────────────────────────────────────────────────────────
+
 def test_loader_assigns_all_rooms_to_building():
-    """load_space_map resolves each room's `building` id to the building's
-    Niagara path, so all rooms auto-roll-up — without repeating the path."""
-    yaml_text = """
+    """Each room's `building` id resolves to the building's destination, so all
+    rooms auto-roll-up without repeating the address."""
+    text = """
 buildings:
   - id: bldg_a
     name: "Building A"
-    niagara_path: "A/Building_Occ"
+    target: "A/Building_Occ"
 spaces:
   - space_id: 11
     building: bldg_a
-    niagara_path: "A/Rm11_Occ"
+    target: "A/Rm11_Occ"
   - space_id: 12
     building: bldg_a
-    niagara_path: "A/Rm12_Occ"
+    target: "A/Rm12_Occ"
   - space_id: 13
-    niagara_path: "A/Rm13_Occ"   # no building -> should NOT roll up
+    target: "A/Rm13_Occ"
 """
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(yaml_text)
-        path = fh.name
-    try:
-        space_map = load_space_map(path, CONFIG)
-    finally:
-        os.unlink(path)
-
-    # Both bldg_a rooms resolve to the same building schedule path...
-    assert space_map["11"].building_schedule_path == "A/Building_Occ"
-    assert space_map["12"].building_schedule_path == "A/Building_Occ"
-    # ...and the unassigned room rolls up to nothing.
-    assert space_map["13"].building_schedule_path is None
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert not sm.errors, sm.errors
+    assert sm.spaces["11"].building_destination == dest("A/Building_Occ")
+    assert sm.spaces["12"].building_destination == dest("A/Building_Occ")
+    assert sm.spaces["13"].building_destination is None
 
 
-def test_editor_roundtrip_feeds_loader():
-    """The GUI editor's dump -> the sync's load_space_map: a room added in the
-    editor resolves to its building's schedule path, end to end."""
-    import editor
-
-    buildings = [{"id": "bldg_a", "name": "Building A",
-                  "niagara_path": "A/Building_Occ"}]
-    rooms = [
-        {"space_id": 11, "space_name": "A 101", "building": "bldg_a",
-         "niagara_path": "A/Rm101_Occ", "pre_condition_minutes": 30},
-        {"space_id": 12, "niagara_path": "A/Rm102_Occ"},   # no building
-    ]
-    text = editor.dump_mapping(buildings, rooms)
-
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(text)
-        path = fh.name
-    try:
-        # Round-trips through the editor's own loader...
-        b2, r2 = editor.load_mapping(path)
-        assert len(b2) == 1 and len(r2) == 2, (b2, r2)
-        # ...and is consumed correctly by the sync's loader.
-        space_map = load_space_map(path, CONFIG)
-    finally:
-        os.unlink(path)
-
-    assert space_map["11"].building_schedule_path == "A/Building_Occ"
-    assert space_map["12"].building_schedule_path is None
+def test_loader_accepts_legacy_niagara_path():
+    """A pre-2.0 map using `niagara_path:` still loads unchanged, so an
+    existing campus upgrades without a mass edit."""
+    text = """
+buildings:
+  - id: b
+    niagara_path: "B/Building_Occ"
+spaces:
+  - space_id: 1
+    building: b
+    niagara_path: "B/Rm1"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert not sm.errors, sm.errors
+    assert sm.spaces["1"].destination == dest("B/Rm1")
+    assert sm.spaces["1"].building_destination == dest("B/Building_Occ")
 
 
-def test_editor_flags_unknown_building():
-    """unknown_building_refs catches a room pointing at a missing building."""
-    import editor
-    buildings = [{"id": "bldg_a", "niagara_path": "A/Building_Occ"}]
-    rooms = [{"space_id": 11, "building": "typo_bldg", "niagara_path": "A/Rm.Occ"}]
-    assert editor.unknown_building_refs(buildings, rooms) == ["11"]
+def test_loader_reads_per_room_merge_gap():
+    """merge_gap_minutes is picked up per room, else the global default."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    target: "B/Rm1"
+    merge_gap_minutes: 25
+  - space_id: 2
+    target: "B/Rm2"
+"""
+    cfg = base_config()
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert sm.spaces["1"].merge_gap_minutes == 25
+    assert sm.spaces["2"].merge_gap_minutes == cfg["collegenet"]["merge_gap_minutes"]
 
+
+def test_loader_preserves_explicit_zero_buffers():
+    """An explicit 0 must be honored, not replaced by the default. Regression
+    for the `value or default` coalescing bug — a room that deliberately
+    disables pre-conditioning would otherwise start 30 minutes early."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    target: "B/Rm1"
+    pre_condition_minutes: 0
+    post_buffer_minutes: 0
+    merge_gap_minutes: 0
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    s = sm.spaces["1"]
+    assert (s.pre_condition_minutes, s.post_buffer_minutes,
+            s.merge_gap_minutes) == (0, 0, 0), s
+
+
+def test_building_runup_overrides_global_but_not_room():
+    """Run-up/run-down precedence: room > building > global."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Bldg"
+    pre_condition_minutes: 50
+    post_buffer_minutes: 20
+spaces:
+  - space_id: 1
+    building: b
+    target: "B/Rm1"
+  - space_id: 2
+    building: b
+    target: "B/Rm2"
+    pre_condition_minutes: 5
+  - space_id: 3
+    target: "B/Rm3"
+"""
+    cfg = base_config()
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert sm.spaces["1"].pre_condition_minutes == 50
+    assert sm.spaces["1"].post_buffer_minutes == 20
+    assert sm.spaces["2"].pre_condition_minutes == 5
+    assert sm.spaces["2"].post_buffer_minutes == 20
+    assert sm.spaces["3"].pre_condition_minutes == \
+        cfg["collegenet"]["default_pre_condition_minutes"]
+
+
+def test_system_precedence_room_over_building_over_default():
+    """`system` inherits with the same precedence as the minute settings, so a
+    building can move to a new BAS in one edit."""
+    text = """
+buildings:
+  - id: b
+    system: niagara
+    target: "B/Bldg"
+spaces:
+  - space_id: 1
+    building: b
+    target: "B/Rm1"
+  - space_id: 2
+    building: b
+    system: bacnet_campus
+    target: "12001:5"
+  - space_id: 3
+    target: "B/Rm3"
+"""
+    cfg = base_config()
+    cfg["systems"] = {"niagara": {"driver": "preview"},
+                      "bacnet_campus": {"driver": "preview"},
+                      "sys": {"driver": "preview"}}
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert not sm.errors, sm.errors
+    assert sm.spaces["1"].destination.system == "niagara"
+    assert sm.spaces["2"].destination.system == "bacnet_campus"
+    assert sm.spaces["3"].destination.system == "sys"      # the default
+    assert sm.spaces["1"].building_destination.system == "niagara"
+
+
+def test_loader_rejects_unknown_system():
+    """A typo'd system name is a hard error, not a silent write somewhere else."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    system: typo_system
+    target: "B/Rm1"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert any("typo_system" in e for e in sm.errors), sm.errors
+
+
+def test_loader_reports_missing_target_and_duplicate_space_id():
+    """Structural mistakes come back as errors, all at once."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    space_name: "no target"
+  - space_id: 2
+    target: "B/Rm2"
+  - space_id: 2
+    target: "B/Rm2dup"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert any("no `target:`" in e for e in sm.errors), sm.errors
+    assert any("mapped twice" in e for e in sm.errors), sm.errors
+
+
+def test_loader_warns_on_shared_target():
+    """Two rooms on one schedule is legal but worth flagging."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    target: "B/Shared"
+  - space_id: 2
+    target: "B/Shared"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert not sm.errors, sm.errors
+    assert any("2 rooms" in w for w in sm.warnings), sm.warnings
+
+
+def test_loader_survives_broken_yaml():
+    """A malformed map reports an error instead of raising into the run."""
+    sm = with_yaml("buildings: [\nspaces:", lambda p: load_space_map(p, base_config()))
+    assert sm.errors and not sm.spaces
+
+
+def test_destinations_include_rollups():
+    """Every schedule the sync owns — rooms AND roll-ups — is enumerated.
+
+    Regression: the old clear-loop only checked room paths, so a building whose
+    rooms all lost their bookings kept conditioning on last week's schedule
+    indefinitely."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+spaces:
+  - space_id: 1
+    building: b
+    target: "B/Rm1"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert sm.destinations() == {dest("B/Rm1"), dest("B/Occ")}, sm.destinations()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# config
+# ─────────────────────────────────────────────────────────────────────────────
 
 def test_load_config_merges_and_builds_base_url():
-    """load_config deep-merges config.yaml over DEFAULTS, derives base_url from
-    the instance, and falls back to defaults when the file is missing."""
-    import main
-    yaml_text = """
+    """config.yaml deep-merges over the built-ins and base_url derives from the
+    instance name."""
+    text = """
 collegenet:
   instance: demo-univ
   lookahead_days: 14
-niagara:
-  host: niagara.example.edu
-  port: 8443
 timezone: America/Chicago
+systems:
+  main:
+    driver: preview
 """
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(yaml_text)
-        path = fh.name
-    try:
-        cfg = main.load_config(path)
-    finally:
-        os.unlink(path)
-
+    cfg = with_yaml(text, load_config)
     assert cfg["collegenet"]["lookahead_days"] == 14
-    assert cfg["niagara"]["host"] == "niagara.example.edu"
-    assert cfg["niagara"]["port"] == 8443
     assert cfg["timezone"] == "America/Chicago"
-    # Deep merge preserves untouched defaults rather than replacing the section.
+    # A deep merge preserves untouched defaults rather than replacing the section.
     assert cfg["collegenet"]["merge_gap_minutes"] == 5
-    # base_url derived from the instance name.
     assert cfg["collegenet"]["base_url"].endswith("/demo-univ/run")
-    # Missing file -> pure defaults, no crash.
-    cfg2 = main.load_config("/nonexistent/path/config.yaml")
+    cfg2 = load_config("/nonexistent/path/config.yaml")
     assert cfg2["collegenet"]["lookahead_days"] == 7
 
 
+def test_load_config_reads_defaults_file():
+    """defaults.yaml overrides the built-in scheduling defaults."""
+    def _run(cpath):
+        return with_yaml(
+            "pre_condition_minutes: 45\npost_buffer_minutes: 25\n"
+            "merge_gap_minutes: 8\nlookahead_days: 14\n",
+            lambda dpath: load_config(cpath, dpath))
+    cn = with_yaml("collegenet:\n  instance: demo\n", _run)["collegenet"]
+    assert (cn["default_pre_condition_minutes"], cn["default_post_buffer_minutes"],
+            cn["merge_gap_minutes"], cn["lookahead_days"]) == (45, 25, 8, 14), cn
+
+
+def test_legacy_niagara_block_becomes_a_system():
+    """A pre-2.0 config with a bare `niagara:` block keeps working: it is
+    promoted to a system and becomes the default."""
+    cfg = {"niagara": {"host": "n4.example.edu", "port": 8443,
+                       "schedule_base_path": "slot:/Schedules"}}
+    migrate_legacy_systems(cfg)
+    assert "niagara" not in cfg, "the legacy block should be consumed"
+    assert cfg["systems"]["niagara"]["driver"] == "niagara"
+    assert cfg["systems"]["niagara"]["host"] == "n4.example.edu"
+    assert cfg["default_system"] == "niagara"
+
+
+def test_explicit_systems_beat_the_legacy_block():
+    """A site mid-migration keeps both; the explicit entry wins."""
+    cfg = {"niagara": {"host": "old.example.edu", "port": 8443},
+           "systems": {"niagara": {"driver": "niagara", "host": "new.example.edu"}}}
+    migrate_legacy_systems(cfg)
+    assert cfg["systems"]["niagara"]["host"] == "new.example.edu"
+    assert cfg["systems"]["niagara"]["port"] == 8443   # gap filled by the legacy block
+
+
+def test_single_system_is_the_implicit_default():
+    """One system needs no `default_system`; several with none is ambiguous and
+    must not be guessed at."""
+    assert resolve_default_system({"systems": {"only": {}}}) == "only"
+    assert resolve_default_system({"systems": {"a": {}, "b": {}}}) == ""
+    assert resolve_default_system({"systems": {"a": {}, "b": {}},
+                                   "default_system": "b"}) == "b"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACnet encoding
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_bacnet_target_parsing():
+    from bassync.drivers.bacnet import DEFAULT_BACNET_PORT, parse_target
+    t = parse_target("12001:5")
+    assert (t.device_id, t.schedule_instance, t.address) == (12001, 5, None)
+    t = parse_target("12001:5@10.4.2.30")
+    assert t.address == f"10.4.2.30:{DEFAULT_BACNET_PORT}"
+    assert parse_target("12001:5@10.4.2.30:47810").address == "10.4.2.30:47810"
+
+
+def test_bacnet_target_rejects_garbage():
+    from bassync.drivers.base import DriverError
+    from bassync.drivers.bacnet import parse_target
+    for bad in ("", "slot:/Schedules/Rm1", "12001", "abc:5"):
+        try:
+            parse_target(bad)
+        except DriverError:
+            continue
+        raise AssertionError(f"{bad!r} should not parse as a BACnet target")
+
+
+def test_bacnet_groups_windows_by_date():
+    """One special event per calendar date, with alternating ON/OFF times.
+
+    This is what keeps the Exception_Schedule array inside the limits real
+    controllers enforce — a per-booking encoding would need one array entry per
+    class."""
+    from bassync.drivers.bacnet import windows_to_daily
+    windows = [OccupancyWindow(dt(9, day=10), dt(11, day=10)),
+               OccupancyWindow(dt(13, day=10), dt(17, day=10)),
+               OccupancyWindow(dt(8, day=11), dt(9, day=11))]
+    by_date = windows_to_daily(windows, TZ)
+    assert len(by_date) == 2, by_date
+    day10 = by_date[dt(9, day=10).date()]
+    assert [(d.strftime("%H:%M"), v) for d, v in day10] == [
+        ("09:00", True), ("11:00", False), ("13:00", True), ("17:00", False)], day10
+
+
+def test_bacnet_splits_windows_across_midnight():
+    """A booking running past midnight becomes an entry on each date — BACnet
+    exceptions are keyed by calendar date and a time cannot be 24:00."""
+    from bassync.drivers.bacnet import windows_to_daily
+    by_date = windows_to_daily(
+        [OccupancyWindow(dt(22, day=10), dt(2, day=11))], TZ)
+    assert len(by_date) == 2, by_date
+    first = by_date[dt(0, day=10).date()]
+    second = by_date[dt(0, day=11).date()]
+    # Day one turns ON and does not turn OFF — midnight rollover re-evaluates
+    # against day two's exception, so a trailing OFF would be both illegal and
+    # redundant.
+    assert [(d.strftime("%H:%M"), v) for d, v in first] == [("22:00", True)], first
+    assert [(d.strftime("%H:%M"), v) for d, v in second] == [
+        ("00:00", True), ("02:00", False)], second
+
+
+def test_bacnet_encodes_a_real_exception_schedule():
+    """The array actually encodes and decodes as BACnet. Skipped when
+    BACpypes3 isn't installed, since it is an optional dependency."""
+    try:
+        from bacpypes3.basetypes import SpecialEvent
+        from bacpypes3.constructeddata import ArrayOf
+    except ImportError:
+        print("      (skipped — bacpypes3 not installed)")
+        return
+    from bassync.drivers.bacnet import _bacnet_date, windows_to_daily
+    from bacpypes3.basetypes import CalendarEntry, SpecialEventPeriod, TimeValue
+    from bacpypes3.primitivedata import Boolean, Time
+
+    by_date = windows_to_daily(
+        [OccupancyWindow(dt(9, day=10), dt(17, day=10))], TZ)
+    day = sorted(by_date)[0]
+    events = [SpecialEvent(
+        period=SpecialEventPeriod(calendarEntry=CalendarEntry(date=_bacnet_date(day))),
+        listOfTimeValues=[TimeValue(time=Time((d.hour, d.minute, d.second, 0)),
+                                    value=Boolean(v)) for d, v in by_date[day]],
+        eventPriority=16)]
+    array_type = ArrayOf(SpecialEvent)
+    decoded = array_type.decode(array_type(events).encode())
+    assert len(decoded) == 1
+    assert decoded[0].eventPriority == 16
+    assert len(decoded[0].listOfTimeValues) == 2
+    assert str(decoded[0].period.calendarEntry.date).startswith("2026-6-10")
+
+
+def test_bacnet_describe_is_offline():
+    """--dry-run must never touch the network, including for BACnet."""
+    from bassync.drivers.bacnet import BacnetScheduleWriter
+    writer = BacnetScheduleWriter("campus", {"local_address": "10.0.0.1/24"}, TZ)
+    text = writer.describe("12001:5", [OccupancyWindow(dt(9, day=10), dt(17, day=10))])
+    assert "12001:5" in text and "09:00->ON" in text and "17:00->OFF" in text, text
+    assert "CLEAR" in writer.describe("12001:5", [])
+
+
+def test_bacnet_rejects_bad_event_priority():
+    """eventPriority is 1-16; anything else is a config error caught at startup
+    rather than a rejected write at 2 AM."""
+    from bassync.drivers.base import DriverError
+    from bassync.drivers.bacnet import BacnetScheduleWriter
+    try:
+        BacnetScheduleWriter("x", {"local_address": "10.0.0.1/24",
+                                   "event_priority": 0}, TZ)
+    except DriverError:
+        return
+    raise AssertionError("event_priority 0 should be rejected")
+
+
+def test_split_at_midnight_handles_dst_forward():
+    """The spring-forward day is 23 hours long. Splitting must still land on
+    real local midnight, not 24 hours after the start."""
+    from bassync.drivers.base import ScheduleWriter
+    # 2026-03-08 is the US DST spring-forward date.
+    start = datetime(2026, 3, 7, 22, 0, tzinfo=TZ)
+    end = datetime(2026, 3, 8, 4, 0, tzinfo=TZ)
+    pieces = ScheduleWriter.split_at_midnight([OccupancyWindow(start, end)])
+    assert len(pieces) == 2, pieces
+    boundary = pieces[0].end
+    assert (boundary.hour, boundary.minute) == (0, 0), boundary
+    assert boundary.date() == end.date(), boundary
+    assert pieces[1].start == boundary and pieces[1].end == end
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# drivers: registry + generic REST
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_driver_registry_resolves_and_rejects():
+    from bassync.drivers import DriverError, driver_names, load_driver_class
+    assert {"bacnet", "niagara", "rest", "preview"} <= set(driver_names())
+    assert load_driver_class("n4").name == "niagara"      # alias
+    try:
+        load_driver_class("honeywell_webs")
+    except DriverError as exc:
+        assert "Unknown BAS driver" in str(exc)
+        return
+    raise AssertionError("an unknown driver should raise")
+
+
+def test_rest_driver_renders_templates_without_calling_out():
+    """Placeholders resolve into the path and payload — checked without a
+    server, since the whole point of the driver is a site-supplied contract."""
+    from bassync.drivers.rest import RestScheduleWriter, _fill, _window_context
+    writer = RestScheduleWriter("ebo", {
+        "base_url": "https://ebo.example.edu",
+        "write": {"method": "POST", "path": "/api/sched/{target}/exceptions",
+                  "payload": {"start": "{start_local}", "value": "{value}"}},
+    }, TZ)
+    ctx = writer._context("/Server 1/Bldg A/Occ",
+                          _window_context(OccupancyWindow(dt(9, day=10),
+                                                          dt(17, day=10)), 0, 1))
+    path = writer.write_cfg["path"].replace("{target}", ctx["target"])
+    assert "%2FServer%201" in path, path        # target is URL-encoded in paths
+    body = _fill(writer.write_cfg["payload"], ctx)
+    assert body == {"start": "2026-06-10T09:00:00", "value": "true"}, body
+
+
+def test_preview_driver_writes_csv():
+    from bassync.drivers.preview import PreviewScheduleWriter
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = os.path.join(tmp, "preview.csv")
+        writer = PreviewScheduleWriter("p", {"csv_file": csv_path}, TZ)
+        writer.write_schedule("A/Rm1", [OccupancyWindow(dt(9), dt(10))])
+        writer.write_schedule("A/Rm2", [])
+        writer.close()
+        rows = open(csv_path, encoding="utf-8").read().splitlines()
+    assert len(rows) == 3, rows            # header + two targets
+    assert "A/Rm1" in rows[1] and "A/Rm2" in rows[2], rows
+
+
+def test_niagara_retry_adapter_excludes_post():
+    """The session retries GET/DELETE but never POST, so a retry can't create
+    duplicate special events."""
+    from bassync.drivers.niagara import NiagaraScheduleWriter
+    writer = NiagaraScheduleWriter("n", {"host": "h", "port": 443},
+                                   TZ, {"attempts": 2, "backoff_seconds": 0})
+    methods = set(writer.session.get_adapter("https://x").max_retries.allowed_methods)
+    assert "GET" in methods and "DELETE" in methods, methods
+    assert "POST" not in methods, methods
+    writer.close()
+
+
+def test_niagara_ord_encoding_and_absolute_targets():
+    """Spaces in schedule names are encoded; an absolute ORD bypasses the base
+    path so a schedule outside it is still reachable."""
+    from bassync.drivers.niagara import NiagaraScheduleWriter
+    writer = NiagaraScheduleWriter(
+        "n", {"host": "h", "port": 443, "schedule_base_path": "slot:/Schedules"}, TZ)
+    assert writer._full_ord("Bldg A/Rm 101") == "slot:/Schedules/Bldg A/Rm 101"
+    assert writer._full_ord("slot:/Other/Sched") == "slot:/Other/Sched"
+    assert "%20" in writer._endpoint("Bldg A/Rm 101")
+    assert "slot:/Schedules" in writer._endpoint("Bldg A/Rm 101")
+    writer.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# safety rail
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_safety_blocks_a_campus_wide_clear():
+    """Zero events from 25Live is an auth/query failure far more often than an
+    empty campus, and writing it would stand every building down."""
+    from bassync import safety
+    cfg = base_config()
+    verdict = safety.check(cfg, {}, {dest("A/Rm1"), dest("A/Rm2")},
+                           event_count=0, previous={})
+    assert not verdict
+    assert "min_events" in verdict.reason
+
+
+def test_safety_blocks_a_large_partial_clear():
+    """Most of the campus going dark at once is stopped even when some events
+    did come back."""
+    from bassync import safety
+    previous = {"windows": {"sys:A/Rm1": 3, "sys:A/Rm2": 2, "sys:A/Rm3": 4}}
+    schedule = {dest("A/Rm1"): [OccupancyWindow(dt(9), dt(10))],
+                dest("A/Rm2"): [], dest("A/Rm3"): []}
+    verdict = safety.check(base_config(), schedule, set(schedule),
+                           event_count=1, previous=previous)
+    assert not verdict and "max_cleared_fraction" in verdict.reason, verdict.reason
+
+
+def test_safety_allows_a_normal_run():
+    """One room going quiet is ordinary and must not block the night's sync."""
+    from bassync import safety
+    previous = {"windows": {"sys:A/Rm1": 3, "sys:A/Rm2": 2, "sys:A/Rm3": 4}}
+    schedule = {dest("A/Rm1"): [OccupancyWindow(dt(9), dt(10))],
+                dest("A/Rm2"): [OccupancyWindow(dt(9), dt(10))],
+                dest("A/Rm3"): []}
+    assert safety.check(base_config(), schedule, set(schedule),
+                        event_count=12, previous=previous)
+
+
+def test_safety_allows_the_first_ever_run():
+    """No history means nothing to compare against — a guard that blocks the
+    first run is just an outage."""
+    from bassync import safety
+    schedule = {dest("A/Rm1"): [OccupancyWindow(dt(9), dt(10))]}
+    verdict = safety.check(base_config(), schedule, set(schedule),
+                           event_count=5, previous={})
+    assert verdict and "no previous run" in verdict.reason
+
+
+def test_safety_scopes_to_one_system_when_limited():
+    """A --system run must compare against that system only. Otherwise every
+    OTHER system's schedules look 'cleared' and the rail blocks a perfectly
+    normal single-building commissioning run."""
+    from bassync import safety
+    previous = {"windows": {"supervisor:A/Rm1": 3, "campus_bacnet:12001:5": 2,
+                            "campus_bacnet:12001:6": 4}}
+    schedule = {Destination("supervisor", "A/Rm1"): [OccupancyWindow(dt(9), dt(10))]}
+    assert safety.check(base_config(), schedule, set(schedule), event_count=5,
+                        previous=previous, only_system="supervisor")
+    # Unscoped, the same run reads as a campus-wide clear.
+    assert not safety.check(base_config(), schedule, set(schedule),
+                            event_count=5, previous=previous)
+
+
+def test_safety_state_merges_on_a_scoped_run():
+    """A --system run must not wipe the other systems' baseline; the next full
+    run would then trip its own rail."""
+    from bassync import safety
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "last_run.json")
+        safety.save_state(path, {Destination("a", "R1"): [OccupancyWindow(dt(9), dt(10))],
+                                 Destination("b", "R2"): [OccupancyWindow(dt(9), dt(10))]},
+                          event_count=4)
+        safety.save_state(path, {Destination("a", "R1"): []}, event_count=1,
+                          only_system="a")
+        state = safety.load_state(path)
+    assert state["windows"] == {"a:R1": 0, "b:R2": 1}, state
+
+
+def test_safety_can_be_disabled():
+    from bassync import safety
+    cfg = base_config()
+    cfg["safety"]["enabled"] = False
+    assert safety.check(cfg, {}, {dest("A/Rm1")}, event_count=0, previous={})
+
+
+def test_safety_state_roundtrip():
+    from bassync import safety
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sub", "last_run.json")
+        safety.save_state(path, {dest("A/Rm1"): [OccupancyWindow(dt(9), dt(10))],
+                                 dest("A/Rm2"): []}, event_count=7)
+        state = safety.load_state(path)
+    assert state["event_count"] == 7
+    assert state["windows"] == {"sys:A/Rm1": 1, "sys:A/Rm2": 0}, state
+    assert safety.load_state("/nonexistent/state.json") == {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 25Live client
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_naive_25live_datetime_uses_configured_tz():
+    """A naive 25Live timestamp is read in the configured campus timezone, not
+    the server's. Regression for .astimezone() on a naive datetime, which
+    shifted every booking when the job ran on a UTC host."""
+    from bassync.collegenet import CollegeNetClient
+    client = CollegeNetClient({"base_url": "http://x"}, TZ)
+    d = client._to_tz("2026-06-10T09:00:00")
+    assert d.tzinfo is not None and (d.hour, d.minute) == (9, 0), d
+    assert d.utcoffset() == timedelta(hours=-4), d.utcoffset()
+    client.close()
+
+
+def test_state_param_styles():
+    """Series25 instances differ in how they want the state filter, and getting
+    it wrong returns 200 with zero events."""
+    from bassync.collegenet import CollegeNetClient
+
+    def client(style):
+        return CollegeNetClient({"base_url": "http://x", "include_states": [2, 4],
+                                 "state_param_style": style}, TZ)
+    assert client("plus")._state_params() == {"state": "2+4"}
+    assert client("comma")._state_params() == {"state": "2,4"}
+    assert client("repeat")._state_params() == {"state": ["2", "4"]}
+    assert client("none")._state_params() == {}
+
+
 def test_discover_collects_spaces_from_xml():
-    """discover_spaces' parsing pulls space_id + space_name out of event XML."""
     import xml.etree.ElementTree as ET
-    import main
-    cn = main.CollegeNetClient(main.CONFIG["collegenet"], TZ)
+    from bassync.collegenet import CollegeNetClient
+    client = CollegeNetClient({"base_url": "http://x"}, TZ)
     xml = """<r25:results xmlns:r25="http://www.collegenet.com/r25">
       <r25:event><r25:reservations><r25:reservation><r25:space_reservation>
         <r25:space_id>101</r25:space_id><r25:space_name>Room A</r25:space_name>
@@ -388,106 +808,429 @@ def test_discover_collects_spaces_from_xml():
       </r25:space_reservation></r25:reservation></r25:reservations></r25:event>
     </r25:results>"""
     seen: dict = {}
-    cn._collect_spaces_from(ET.fromstring(xml), seen)
+    client._collect_spaces_from(ET.fromstring(xml), seen)
     assert seen == {"101": "Room A", "102": "Room B Formal"}, seen
+    client.close()
 
 
-def test_retry_adapter_excludes_post_for_writes():
-    """The Niagara session retries GET/DELETE but never POST, so a retry can't
-    create duplicate special events."""
-    import main
-    n4 = main.NiagaraClient(main.CONFIG["niagara"], TZ,
-                            {"attempts": 2, "backoff_seconds": 0})
-    methods = set(n4.session.get_adapter("https://x").max_retries.allowed_methods)
-    assert "GET" in methods and "DELETE" in methods, methods
-    assert "POST" not in methods, methods
+def test_parse_event_applies_buffers_and_dedupes_spaces():
+    """Buffers widen the window, and a space id repeated in the XML yields ONE
+    RawEvent rather than a duplicate per nesting level."""
+    import xml.etree.ElementTree as ET
+    from bassync.collegenet import CollegeNetClient
+    client = CollegeNetClient({"base_url": "http://x", "include_states": [2]}, TZ)
+    xml = """<r25:event xmlns:r25="http://www.collegenet.com/r25">
+      <r25:event_id>E9</r25:event_id><r25:event_name>Chem 101</r25:event_name>
+      <r25:state>2</r25:state>
+      <r25:reservations><r25:reservation>
+        <r25:event_start_dt>2026-06-10T09:00:00</r25:event_start_dt>
+        <r25:event_end_dt>2026-06-10T10:00:00</r25:event_end_dt>
+        <r25:space_reservation><r25:space_id>1</r25:space_id>
+          <r25:space><r25:space_id>1</r25:space_id></r25:space>
+        </r25:space_reservation>
+      </r25:reservation></r25:reservations>
+    </r25:event>"""
+    sm = {"1": space(1, "room", "B/Rm1")}
+    sm["1"].pre_condition_minutes = 30
+    sm["1"].post_buffer_minutes = 15
+    events = client._parse_event(ET.fromstring(xml), sm)
+    assert len(events) == 1, events
+    assert events[0].start == dt(8, 30, day=10), events[0].start
+    assert events[0].end == dt(10, 15, day=10), events[0].end
+    client.close()
 
 
-def test_send_alert_webhook_and_disabled():
-    """send_alert posts to the webhook when enabled, and is a no-op when not."""
-    import main
-    captured = {}
+def test_parse_event_honors_25live_setup_teardown():
+    """When 25Live's own setup/takedown is wider than our buffers, it wins —
+    the room really is in use for the setup crew."""
+    import xml.etree.ElementTree as ET
+    from bassync.collegenet import CollegeNetClient
+    client = CollegeNetClient({"base_url": "http://x"}, TZ)
+    xml = """<r25:event xmlns:r25="http://www.collegenet.com/r25">
+      <r25:event_id>E1</r25:event_id>
+      <r25:reservations><r25:reservation>
+        <r25:event_start_dt>2026-06-10T09:00:00</r25:event_start_dt>
+        <r25:event_end_dt>2026-06-10T10:00:00</r25:event_end_dt>
+        <r25:setup_dt>2026-06-10T07:00:00</r25:setup_dt>
+        <r25:takedown_dt>2026-06-10T12:00:00</r25:takedown_dt>
+        <r25:space_id>1</r25:space_id>
+      </r25:reservation></r25:reservations>
+    </r25:event>"""
+    sm = {"1": space(1, "room", "B/Rm1")}
+    sm["1"].pre_condition_minutes = 30
+    sm["1"].post_buffer_minutes = 15
+    ev = client._parse_event(ET.fromstring(xml), sm)[0]
+    assert ev.start == dt(7, day=10) and ev.end == dt(12, day=10), (ev.start, ev.end)
+    client.close()
 
-    def fake_post(url, json=None, timeout=None, **kw):
-        captured["url"] = url
-        captured["json"] = json
-        class _R:
-            status_code = 200
-        return _R()
 
-    original = main.requests.post
-    main.requests.post = fake_post
+def test_parse_event_filters_by_state_client_side():
+    """The state filter is applied to the response too, so `state_param_style:
+    none` still only syncs confirmed events."""
+    import xml.etree.ElementTree as ET
+    from bassync.collegenet import CollegeNetClient
+    client = CollegeNetClient({"base_url": "http://x", "include_states": [2]}, TZ)
+    xml = """<r25:event xmlns:r25="http://www.collegenet.com/r25">
+      <r25:event_id>E1</r25:event_id><r25:state>1</r25:state>
+      <r25:reservations><r25:reservation>
+        <r25:event_start_dt>2026-06-10T09:00:00</r25:event_start_dt>
+        <r25:event_end_dt>2026-06-10T10:00:00</r25:event_end_dt>
+        <r25:space_id>1</r25:space_id>
+      </r25:reservation></r25:reservations></r25:event>"""
+    assert client._parse_event(ET.fromstring(xml),
+                              {"1": space(1, "room", "B/Rm1")}) == []
+    client.close()
+
+
+def test_html_error_page_is_reported_clearly():
+    """A login page where XML was expected must say so, not raise a bare
+    ParseError from deep in the stdlib."""
+    from bassync.collegenet import CollegeNetClient, CollegeNetError
+    client = CollegeNetClient({"base_url": "http://x"}, TZ)
+    # Real HTML, with the unclosed tags that make it invalid XML.
+    page = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
+            "<title>Sign in</title></head><body>Please sign in<br></body></html>")
     try:
-        main.send_alert({"enabled": True, "webhook_url": "http://hook"},
-                        "Subject X", "Body Y")
-        assert captured.get("url") == "http://hook"
-        assert "Subject X" in captured["json"]["text"]
-
-        captured.clear()
-        main.send_alert({"enabled": False, "webhook_url": "http://hook"}, "s", "b")
-        assert captured == {}, "disabled alerts must not post"
+        client._parse_xml(page, "fetching events")
+    except CollegeNetError as exc:
+        assert "not valid XML" in str(exc) and "Sign in" in str(exc), exc
+        return
     finally:
-        main.requests.post = original
+        client.close()
+    raise AssertionError("an HTML error page should raise CollegeNetError")
 
 
-def test_load_config_reads_defaults_file():
-    """defaults.yaml overrides the built-in scheduling defaults and maps onto
-    the internal config keys."""
-    import main
-    cfg_text = "collegenet:\n  instance: demo\n"
-    def_text = ("pre_condition_minutes: 45\npost_buffer_minutes: 25\n"
-                "merge_gap_minutes: 8\nlookahead_days: 14\n")
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f1:
-        f1.write(cfg_text)
-        cpath = f1.name
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f2:
-        f2.write(def_text)
-        dpath = f2.name
-    try:
-        cfg = main.load_config(cpath, dpath)
-    finally:
-        os.unlink(cpath)
-        os.unlink(dpath)
-    cn = cfg["collegenet"]
-    assert cn["default_pre_condition_minutes"] == 45, cn
-    assert cn["default_post_buffer_minutes"] == 25, cn
-    assert cn["merge_gap_minutes"] == 8, cn
-    assert cn["lookahead_days"] == 14, cn
+def test_wellformed_but_wrong_xml_is_caught_by_validate():
+    """An SSO login page that happens to be valid XHTML parses fine and then
+    yields zero events — which a live run would read as an empty campus. The
+    connection check names the real cause instead."""
+    from bassync.collegenet import CollegeNetClient
+    client = CollegeNetClient({"base_url": "http://x"}, TZ)
+
+    class FakeResponse:
+        status_code = 200
+        text = "<html><body>Please sign in with your NetID</body></html>"
+
+    client.session.get = lambda *a, **kw: FakeResponse()
+    ok, detail = client.check_connection()
+    assert not ok, detail
+    assert "SSO" in detail and "<html>" in detail, detail
+    client.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# editor round-trip
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_editor_roundtrip_feeds_loader():
+    """A room added in the editor resolves to its building's schedule, end to
+    end through the editor's dump and the sync's loader."""
+    import editor
+    buildings = [{"id": "bldg_a", "name": "Building A", "target": "A/Building_Occ"}]
+    rooms = [{"space_id": 11, "space_name": "A 101", "building": "bldg_a",
+              "target": "A/Rm101_Occ", "pre_condition_minutes": 30},
+             {"space_id": 12, "target": "A/Rm102_Occ"}]
+
+    def _check(path):
+        b2, r2 = editor.load_mapping(path)
+        assert len(b2) == 1 and len(r2) == 2, (b2, r2)
+        return load_space_map(path, base_config())
+
+    sm = with_yaml(editor.dump_mapping(buildings, rooms), _check)
+    assert not sm.errors, sm.errors
+    assert sm.spaces["11"].building_destination == dest("A/Building_Occ")
+    assert sm.spaces["12"].building_destination is None
+
+
+def test_editor_migrates_legacy_key_on_load():
+    """Opening a pre-2.0 map renames niagara_path -> target in place, so saving
+    it upgrades the file without anyone doing a find-and-replace."""
+    import editor
+    text = ("buildings:\n  - id: b\n    niagara_path: 'B/Occ'\n"
+            "spaces:\n  - space_id: 1\n    niagara_path: 'B/Rm1'\n")
+    buildings, rooms = with_yaml(text, editor.load_mapping)
+    assert buildings[0]["target"] == "B/Occ" and "niagara_path" not in buildings[0]
+    assert rooms[0]["target"] == "B/Rm1" and "niagara_path" not in rooms[0]
+
+
+def test_editor_keeps_system_through_a_roundtrip():
+    import editor
+    rooms = [{"space_id": 1, "system": "campus_bacnet", "target": "12001:5"}]
+    _b, r2 = with_yaml(editor.dump_mapping([], rooms), editor.load_mapping)
+    assert r2[0]["system"] == "campus_bacnet", r2
+
+
+def test_editor_flags_unknown_building():
+    import editor
+    assert editor.unknown_building_refs(
+        [{"id": "bldg_a", "target": "A/Occ"}],
+        [{"space_id": 11, "building": "typo_bldg", "target": "A/Rm.Occ"}]) == ["11"]
+
+
+def test_editor_reads_systems_from_config():
+    """The System dropdown is populated from config.yaml, and a pre-2.0 config
+    still offers its single Niagara system."""
+    import editor
+    text = "systems:\n  campus_bacnet:\n    driver: bacnet\n  supervisor:\n    driver: niagara\n"
+    assert with_yaml(text, editor.configured_systems) == ["campus_bacnet", "supervisor"]
+    assert with_yaml("niagara:\n  host: n4\n", editor.configured_systems) == ["niagara"]
+    # A missing or broken config must not stop the editor from opening.
+    assert editor.configured_systems("/nonexistent/config.yaml") == []
 
 
 def test_editor_defaults_roundtrip_and_fallback():
-    """dump_defaults -> load_defaults round-trips; a missing file yields the
-    built-in fallbacks (so the GUI always shows real numbers)."""
     import editor
     text = editor.dump_defaults({"pre_condition_minutes": 40,
                                  "post_buffer_minutes": 10,
                                  "merge_gap_minutes": 3, "lookahead_days": 21})
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
-        fh.write(text)
-        path = fh.name
-    try:
-        d = editor.load_defaults(path)
-    finally:
-        os.unlink(path)
+    d = with_yaml(text, editor.load_defaults)
     assert d == {"pre_condition_minutes": 40, "post_buffer_minutes": 10,
                  "merge_gap_minutes": 3, "lookahead_days": 21}, d
     d2 = editor.load_defaults("/nonexistent/defaults.yaml")
     assert d2["pre_condition_minutes"] == 30 and d2["lookahead_days"] == 7, d2
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# alerting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_send_alert_webhook_and_disabled():
+    from bassync import notify
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, **kw):
+        captured.update(url=url, json=json)
+        return type("R", (), {"status_code": 200})()
+
+    original = notify.requests.post
+    notify.requests.post = fake_post
+    try:
+        notify.send_alert({"enabled": True, "webhook_url": "http://hook"},
+                          "Subject X", "Body Y")
+        assert captured.get("url") == "http://hook"
+        assert "Subject X" in captured["json"]["text"]
+        captured.clear()
+        notify.send_alert({"enabled": False, "webhook_url": "http://hook"}, "s", "b")
+        assert captured == {}, "disabled alerts must not post"
+    finally:
+        notify.requests.post = original
+
+
+def test_send_alert_survives_a_dead_webhook():
+    """An alerting failure must never change the run's outcome."""
+    from bassync import notify
+
+    def boom(*a, **kw):
+        raise notify.requests.RequestException("no route to host")
+
+    original = notify.requests.post
+    notify.requests.post = boom
+    try:
+        notify.send_alert({"enabled": True, "webhook_url": "http://hook"}, "s", "b")
+    finally:
+        notify.requests.post = original
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# end to end
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_mixed_campus_dry_run_routes_to_each_system():
+    """The whole pipeline, three vendors at once: rooms land on their own
+    system and the roll-up follows its building's."""
+    from bassync.sync import _group_by_system
+    text = """
+buildings:
+  - id: soc
+    target: "12001:100"
+  - id: eng
+    system: supervisor
+    target: "EngTech/Building_Occ"
+spaces:
+  - space_id: 1
+    building: soc
+    target: "12001:5"
+  - space_id: 2
+    building: soc
+    target: "12001:6"
+  - space_id: 3
+    building: eng
+    target: "EngTech/Rm110_Occ"
+"""
+    cfg = base_config()
+    cfg["systems"] = {"campus_bacnet": {"driver": "bacnet",
+                                        "local_address": "10.0.0.1/24"},
+                      "supervisor": {"driver": "niagara", "host": "h"}}
+    cfg["default_system"] = "campus_bacnet"
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert not sm.errors, sm.errors
+
+    schedule = ScheduleBuilder(5).build(
+        [event(1, dt(9, day=10), dt(10, day=10), "A"),
+         event(2, dt(10, day=10), dt(11, day=10), "B"),
+         event(3, dt(13, day=10), dt(14, day=10), "C")], sm)
+    for d in sm.destinations():
+        schedule.setdefault(d, [])
+
+    grouped = _group_by_system(schedule)
+    assert set(grouped) == {"campus_bacnet", "supervisor"}, grouped
+    assert set(grouped["campus_bacnet"]) == {"12001:5", "12001:6", "12001:100"}
+    assert set(grouped["supervisor"]) == {"EngTech/Rm110_Occ",
+                                          "EngTech/Building_Occ"}
+    # The BACnet roll-up unions both rooms into one 09:00-11:00 window.
+    rollup = grouped["campus_bacnet"]["12001:100"]
+    assert len(rollup) == 1 and rollup[0].end == dt(11, day=10), rollup
+
+
+def test_empty_schedules_are_still_written_so_stale_occupancy_clears():
+    """A room and a building with no bookings this week both appear in the
+    write set, with empty window lists. Regression: the old clear-loop skipped
+    building roll-ups entirely, so a building whose rooms all went quiet kept
+    running on last week's schedule."""
+    text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+spaces:
+  - space_id: 1
+    building: b
+    target: "B/Rm1"
+  - space_id: 2
+    building: b
+    target: "B/Rm2"
+"""
+    cfg = base_config()
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    schedule = ScheduleBuilder(5).build([event(1, dt(9), dt(10))], sm)
+    for d in sm.destinations():
+        schedule.setdefault(d, [])
+    assert schedule[dest("B/Rm2")] == [], "an unbooked room must be cleared"
+    assert len(schedule[dest("B/Occ")]) == 1
+    assert set(schedule) == sm.destinations()
+
+
+def test_run_sync_end_to_end_writes_and_records_state():
+    """The real run_sync path — fetch, build, safety check, fan out, save state
+    — with 25Live stubbed and every system on the `preview` driver.
+
+    Exercises what the unit tests can't: that a system failure is contained,
+    that unbooked schedules are actually written empty, and that the run leaves
+    a state file the next run can compare against."""
+    import bassync.sync as sync_mod
+    from bassync.model import RawEvent as RE
+
+    map_text = """
+buildings:
+  - id: b
+    target: "B/Occ"
+spaces:
+  - space_id: 1
+    building: b
+    target: "B/Rm1"
+  - space_id: 2
+    building: b
+    target: "B/Rm2"
+  - space_id: 3
+    system: broken
+    target: "X/Rm3"
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        map_path = os.path.join(tmp, "map.yaml")
+        with open(map_path, "w", encoding="utf-8") as fh:
+            fh.write(map_text)
+        csv_path = os.path.join(tmp, "out.csv")
+        state_path = os.path.join(tmp, "last_run.json")
+
+        cfg = load_config("/nonexistent/config.yaml")
+        cfg["collegenet"]["base_url"] = "http://stub"
+        cfg["space_map_file"] = map_path
+        cfg["safety"]["state_file"] = state_path
+        cfg["systems"] = {"sys": {"driver": "preview", "csv_file": csv_path},
+                          # A system whose driver cannot be built at all.
+                          "broken": {"driver": "rest", "base_url": ""}}
+        cfg["default_system"] = "sys"
+
+        original = sync_mod._fetch
+        sync_mod._fetch = lambda *a, **kw: [
+            RE("E1", "Class", "1", dt(9, day=10), dt(10, day=10)),
+            RE("E2", "Lab", "1", dt(13, day=10), dt(14, day=10)),
+        ]
+        try:
+            code = sync_mod.run_sync(cfg)
+        finally:
+            sync_mod._fetch = original
+
+        # The broken system fails its own schedule; the rest still wrote.
+        assert code == sync_mod.EXIT_WRITE_FAILURES, code
+        rows = open(csv_path, encoding="utf-8").read()
+        state = __import__("json").load(open(state_path, encoding="utf-8"))
+
+    # Room 1 booked twice, room 2 unbooked but still written (cleared), and the
+    # building rolled up from room 1.
+    assert "B/Rm1" in rows and "B/Rm2" in rows and "B/Occ" in rows, rows
+    assert state["windows"]["sys:B/Rm1"] == 2, state
+    assert state["windows"]["sys:B/Rm2"] == 0, state
+    assert state["windows"]["sys:B/Occ"] == 2, state
+
+
+def test_run_sync_aborts_instead_of_clearing_the_campus():
+    """25Live returning nothing must not become a campus-wide stand-down."""
+    import bassync.sync as sync_mod
+    map_text = """
+buildings: []
+spaces:
+  - space_id: 1
+    target: "B/Rm1"
+  - space_id: 2
+    target: "B/Rm2"
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        map_path = os.path.join(tmp, "map.yaml")
+        with open(map_path, "w", encoding="utf-8") as fh:
+            fh.write(map_text)
+        csv_path = os.path.join(tmp, "out.csv")
+        cfg = load_config("/nonexistent/config.yaml")
+        cfg["collegenet"]["base_url"] = "http://stub"
+        cfg["space_map_file"] = map_path
+        cfg["safety"]["state_file"] = os.path.join(tmp, "last_run.json")
+        cfg["systems"] = {"sys": {"driver": "preview", "csv_file": csv_path}}
+        cfg["default_system"] = "sys"
+
+        original = sync_mod._fetch
+        sync_mod._fetch = lambda *a, **kw: []
+        try:
+            code = sync_mod.run_sync(cfg)
+            wrote_anything = os.path.exists(csv_path)
+            # --force is the documented escape hatch and must actually work.
+            forced = sync_mod.run_sync(cfg, force=True)
+        finally:
+            sync_mod._fetch = original
+        forced_wrote = os.path.exists(csv_path)
+
+    assert code == sync_mod.EXIT_SAFETY_ABORT, code
+    assert not wrote_anything, "the aborted run must not have written"
+    assert forced == sync_mod.EXIT_OK, forced
+    assert forced_wrote, "--force must let the run through"
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failures = 0
+    failures = []
     for t in tests:
         try:
             t()
             print(f"PASS  {t.__name__}")
         except AssertionError as exc:
-            failures += 1
+            failures.append(t.__name__)
             print(f"FAIL  {t.__name__}: {exc}")
-    print(f"\n{len(tests) - failures}/{len(tests)} passed")
+        except Exception as exc:                          # noqa: BLE001
+            failures.append(t.__name__)
+            print(f"ERROR {t.__name__}: {type(exc).__name__}: {exc}")
+    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
+    if failures:
+        print("Failed: " + ", ".join(failures))
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

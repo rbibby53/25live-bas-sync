@@ -1,0 +1,8 @@
+# Additional dependency for the `bacnet` driver.
+#   pip install -r requirements.txt -r requirements-bacnet.txt
+#
+# BACpypes3 is the maintained asyncio rewrite of BACpypes and is what the
+# driver builds its Schedule / SpecialEvent / CalendarEntry objects with.
+# Imported lazily, so this is only needed if a system in config.yaml actually
+# uses driver: bacnet.
+bacpypes3>=0.0.98

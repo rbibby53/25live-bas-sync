@@ -4,7 +4,92 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning once it reaches a tagged release.
 
-## [Unreleased]
+## [2.0.0] — Unreleased
+
+Multi-vendor release. The sync is no longer Niagara-specific: it drives any
+BTL-listed BAS over standard BACnet, and one nightly run can cover a mixed
+campus. **Existing 1.x deployments keep working** — see *Upgrading* below.
+
+### Added
+- **Pluggable BAS drivers.** `python main.py --list-drivers`:
+  - **`bacnet`** — standard ASHRAE 135 Schedule objects over BACnet/IP, via
+    [BACpypes3]. Covers Tridium Niagara, Automated Logic WebCTRL and Schneider
+    EcoStruxure Building Operation with one code path. Writes only
+    `Exception_Schedule`, one special event **per calendar date** (which keeps
+    the array inside the limits real controllers enforce), at `eventPriority`
+    16 so hand-entered exceptions always win. Optional foreign-device/BBMD
+    registration, address pinning, and write-verification read-back.
+  - **`niagara`** — the previous REST writer, with `rest_base`,
+    `special_event_type` and the ORD style now settable from `config.yaml`.
+  - **`rest`** — a generic driver whose endpoints and payloads you describe in
+    `config.yaml`, for a vendor API when BACnet isn't available.
+  - **`preview`** — writes nothing; logs and optionally exports CSV, for staged
+    commissioning one building at a time.
+- **`systems:` config block** and per-space `system:` / `target:` keys, so a
+  mixed campus syncs in one run. Rooms inherit their building's system
+  (precedence room > building > `default_system`).
+- **Mass-clear safety rails** (`safety:`). A run refuses to write if 25Live
+  returned fewer than `min_events` assignments, or if more than
+  `max_cleared_fraction` of previously-occupied schedules would be emptied at
+  once — the signature of an auth failure or an API change, which would
+  otherwise stand the whole campus down under a successful-looking run.
+  `--force` overrides; new exit code `7`.
+- **`--system NAME`** to limit a run to one BAS, and **`--list-drivers`**,
+  **`--version`**, **`--verbose`**.
+- `collegenet.state_param_style` (`plus`/`comma`/`repeat`/`none`) — Series25
+  instances differ in how they want the `state` filter encoded, and getting it
+  wrong returns 200 with zero events.
+- Room-map validation now reports **every** problem at once: missing targets,
+  duplicate `space_id`s, unknown `system:` names, unparseable YAML.
+- Editor: **System** dropdown fed from `config.yaml`, and *Test BAS
+  connections* health-checks every configured system in one pass.
+- CI runs the suite both with and without BACpypes3 installed.
+
+### Fixed
+- **Building roll-ups with no bookings were never cleared.** The clear-loop only
+  considered room targets, so a building whose rooms all lost their bookings
+  kept conditioning on the previous run's schedule indefinitely.
+- **Two rooms sharing one schedule silently lost one room's bookings.** The
+  builder assigned rather than unioned, so whichever room was processed second
+  erased the first — a real pattern for a divisible room split A/B in 25Live but
+  served by a single AHU. Their windows are now unioned, and the loader warns
+  when it sees a shared target.
+- **A crash sent two alerts** — one "CRASHED", then one "FAILED" for the same
+  event.
+- **`--validate` passed on a broken 25Live endpoint.** Any response at all was
+  treated as success, so a 404 from a wrong `instance`/`base_url`, or an SSO
+  login page where Series25 XML was expected, both reported PASS.
+- A 25Live response that isn't XML (a login page, a proxy error) now reports
+  what it actually got instead of raising a bare `ParseError`.
+- Duplicate `space_id` elements within one reservation no longer produce
+  duplicate events.
+- Reservations that end at or before they start are skipped with a warning
+  rather than producing a negative-length window.
+- `verify_tls: false` no longer reaches through the deprecated
+  `requests.packages.urllib3` path to silence warnings.
+
+### Changed
+- Code reorganised into the importable **`bassync/`** package; `main.py` is now
+  the CLI. `Test.py` remains the test entry point.
+- `event_priority` is documented and configurable, replacing the previous
+  hard-coded `BACNET_SCHEDULE_PRIORITY = 14` — which conflated the
+  BACnetSpecialEvent precedence (which exception wins) with the commandable
+  priority array (which is a different mechanism, and one this tool never
+  touches).
+- Per-system passwords via `BAS_SYS_<NAME>_PASSWORD`; a password left in
+  `config.yaml` now warns.
+- Repository renamed to **25live-bas-sync**.
+
+### Upgrading from 1.x
+- A top-level `niagara:` block is promoted to `systems:` automatically and made
+  the default — no edit required.
+- `BAS_NIAGARA_PASSWORD` and `niagara_path:` are both still honored.
+- Expect some buildings to stand down after the upgrade: that is the roll-up
+  clear-loop fix working. Run `--validate` and `--dry-run` first.
+
+[BACpypes3]: https://github.com/JoelBender/BACpypes3
+
+## [1.x]
 
 ### Added
 - **`defaults.yaml`** — global scheduling defaults (run-up, run-down, merge-gap,

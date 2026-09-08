@@ -1,4 +1,4 @@
-# 25Live -> Niagara N4 sync dependencies
+# 25Live -> BAS Schedule Sync — core dependencies
 # Install with:  pip install -r requirements.txt
 requests>=2.31,<3
 python-dateutil>=2.8,<3
@@ -7,3 +7,7 @@ PyYAML>=6,<7
 # zoneinfo.ZoneInfo("America/New_York") raises ZoneInfoNotFoundError unless the
 # tzdata package is installed. Harmless on Linux/macOS.
 tzdata>=2024.1
+
+# The BACnet driver needs BACpypes3 as well — it is kept out of this file so a
+# Niagara-only or REST-only site doesn't carry a dependency it never imports:
+#   pip install -r requirements-bacnet.txt

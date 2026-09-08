@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 25Live -> Niagara Schedule Sync — Room/Building Mapping Editor
+# 25Live -> BAS Schedule Sync — Room/Building Mapping Editor
 # Copyright (C) 2026 Ryan Bibby and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under
@@ -11,11 +11,17 @@
 Room / Building Mapping Editor  (GUI)
 =====================================
 A small desktop editor for `space_mapping.yaml` — the file that tells the
-25Live → Niagara sync which 25Live spaces map to which Niagara schedules.
+25Live → BAS sync which 25Live spaces map to which BAS schedules.
 
 Use this instead of hand-editing YAML. It edits the SAME file `main.py` reads,
-so the sync picks up changes on its next run. It does not touch 25Live or
-Niagara.
+so the sync picks up changes on its next run. It does not touch 25Live or any
+building automation system.
+
+Each room and building names the `system` its schedule lives on (a key from
+`systems:` in config.yaml) and the `target` address within that system. The
+System dropdown is populated from config.yaml, so a mixed campus — some
+buildings on BACnet, some on a Niagara supervisor — is a pick from a list
+rather than something to remember.
 
 Run:
     python editor.py                 # opens the mapping next to this script
@@ -38,7 +44,7 @@ DEFAULT_MAP_FILE = Path(__file__).parent / "space_mapping.yaml"
 
 # Written to the top of the file on save so a hand-editor knows the format.
 FILE_HEADER = """\
-# 25Live → Niagara N4 schedule cross-reference.
+# 25Live → BAS schedule cross-reference.
 #
 # This file is managed by editor.py (the Room Mapping Editor) but is plain YAML
 # and safe to hand-edit. See README.md for the full field reference.
@@ -47,14 +53,28 @@ FILE_HEADER = """\
 #   spaces:     the rooms; each room names the `building` it belongs to, and
 #               every room in a building is automatically unioned into that
 #               building's occupancy schedule (any room occupied -> building on).
+#
+#   system:     which BAS this schedule lives on — a key from `systems:` in
+#               config.yaml. Omit to use `default_system`. Rooms inherit their
+#               building's system.
+#   target:     the schedule's address within that system. Its syntax depends
+#               on the driver:
+#                 bacnet   "12001:5"          device instance : schedule instance
+#                                             (add "@10.4.2.30" to pin the address)
+#                 niagara  "Bldg/Rm101_Occ"   ORD under schedule_base_path
+#                 rest     whatever your API path template expects
 """
 
 # Field order we emit so the file reads cleanly and diffs stay stable.
-BUILDING_KEY_ORDER = ["id", "name", "niagara_path",
+BUILDING_KEY_ORDER = ["id", "name", "system", "target",
                       "pre_condition_minutes", "post_buffer_minutes", "space_id"]
-ROOM_KEY_ORDER = ["space_id", "space_name", "building", "niagara_path",
+ROOM_KEY_ORDER = ["space_id", "space_name", "building", "system", "target",
                   "pre_condition_minutes", "post_buffer_minutes",
                   "merge_gap_minutes", "note"]
+
+# Pre-2.0 key name. Read and migrated to `target` on load, so an existing map
+# opens, edits and saves without anyone having to do a find-and-replace.
+LEGACY_TARGET_KEY = "niagara_path"
 
 DEFAULT_DEFAULTS_FILE = Path(__file__).parent / "defaults.yaml"
 
@@ -88,9 +108,25 @@ def load_mapping(path) -> tuple[list[dict], list[dict]]:
         return [], []
     with open(p, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
-    buildings = list(data.get("buildings", []) or [])
-    rooms = list(data.get("spaces", []) or [])
+    buildings = [_migrate_row(b) for b in (data.get("buildings", []) or [])]
+    rooms = [_migrate_row(r) for r in (data.get("spaces", []) or [])]
     return buildings, rooms
+
+
+def _migrate_row(row: dict) -> dict:
+    """Rename a pre-2.0 `niagara_path:` to `target:`, preserving field order.
+
+    Done on load rather than on save so the editor only ever deals in one key
+    name, and an old map upgrades the first time someone saves it."""
+    if not isinstance(row, dict) or LEGACY_TARGET_KEY not in row:
+        return dict(row) if isinstance(row, dict) else row
+    out = {}
+    for key, value in row.items():
+        if key == LEGACY_TARGET_KEY:
+            out.setdefault("target", value)
+        else:
+            out[key] = value
+    return out
 
 
 def _ordered(row: dict, key_order: list[str]) -> dict:
@@ -131,6 +167,30 @@ def unknown_building_refs(buildings: list[dict], rooms: list[dict]) -> list[str]
         if b is not None and str(b) not in known:
             bad.append(str(r.get("space_id")))
     return bad
+
+
+def configured_systems(config_path=None) -> list:
+    """
+    System names from config.yaml, for the System dropdown.
+
+    Read directly rather than through main.py so the editor still opens (and
+    still edits the map) when config.yaml is missing or malformed — the mapping
+    editor should not be blocked by a connection-settings problem.
+    """
+    path = Path(config_path or os.environ.get("BAS_CONFIG")
+                or Path(__file__).parent / "config.yaml")
+    try:
+        if not path.exists():
+            return []
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    names = list((data.get("systems") or {}).keys())
+    # A pre-2.0 config has a bare `niagara:` block instead of `systems:`.
+    if not names and isinstance(data.get("niagara"), dict):
+        names = ["niagara"]
+    return sorted(str(n) for n in names)
 
 
 def load_defaults(path) -> dict:
@@ -241,6 +301,15 @@ def run_gui(map_path: Path) -> int:
             self.destroy()
 
     NONE_LABEL = "(none)"
+    # Rooms inherit their building's system; buildings fall back to
+    # config.yaml's `default_system`. Both are stored as "no system key".
+    INHERIT_LABEL = "(inherit)"
+    DEFAULT_LABEL = "(default)"
+
+    def _strip_sentinels(values: dict) -> None:
+        """Drop the placeholder system labels — absent means inherit."""
+        if values.get("system") in (None, "", INHERIT_LABEL, DEFAULT_LABEL):
+            values.pop("system", None)
 
     class EditorApp(tk.Tk):
         def __init__(self, path: Path):
@@ -250,9 +319,13 @@ def run_gui(map_path: Path) -> int:
             self.rooms: list[dict] = []
             self.defaults_path = DEFAULT_DEFAULTS_FILE
             self.defaults = load_defaults(self.defaults_path)
+            # Populates the System dropdowns. Empty when config.yaml is absent,
+            # in which case the field falls back to free text so the map can
+            # still be built before the connection settings exist.
+            self.systems = configured_systems()
             self.dirty = False
 
-            self.title("25Live → Niagara — Room Mapping Editor")
+            self.title("25Live → BAS — Room Mapping Editor")
             self.geometry("840x520")
             self._build_menu()
             self._build_tabs()
@@ -308,7 +381,7 @@ def run_gui(map_path: Path) -> int:
 
         def _update_title(self):
             star = "*" if self.dirty else ""
-            self.title(f"{star}25Live → Niagara — Room Mapping Editor  [{self.path.name}]")
+            self.title(f"{star}25Live → BAS — Room Mapping Editor  [{self.path.name}]")
 
         # ── menu ──
         def _build_menu(self):
@@ -324,8 +397,8 @@ def run_gui(map_path: Path) -> int:
             toolm = Menu(bar, tearoff=0)
             toolm.add_command(label="Test 25Live connection",
                               command=self._test_25live)
-            toolm.add_command(label="Test Niagara connection",
-                              command=self._test_niagara)
+            toolm.add_command(label="Test BAS connections",
+                              command=self._test_systems)
             toolm.add_separator()
             toolm.add_command(label="Preview (dry run)…", command=self._preview)
             bar.add_cascade(label="Tools", menu=toolm)
@@ -336,44 +409,85 @@ def run_gui(map_path: Path) -> int:
 
         # ── tools (use the sync engine in main.py; need config.yaml) ──
         def _runtime_config(self):
-            import main
+            """The same config the nightly sync would use, secrets included."""
+            from bassync import config as bas_config
             cfg_path = (os.environ.get("BAS_CONFIG")
                         or str(Path(__file__).parent / "config.yaml"))
-            cfg = main.load_config(cfg_path)
-            main.load_credentials(cfg)
-            return main, cfg
+            defaults_path = (os.environ.get("BAS_DEFAULTS")
+                             or str(Path(__file__).parent / "defaults.yaml"))
+            cfg = bas_config.load_config(cfg_path, defaults_path)
+            bas_config.load_credentials(cfg)
+            return bas_config, cfg
 
         def _test_25live(self):
             from zoneinfo import ZoneInfo
             try:
-                main, cfg = self._runtime_config()
+                _cfgmod, cfg = self._runtime_config()
                 if not cfg["collegenet"].get("base_url"):
                     messagebox.showwarning(
                         "Test 25Live",
                         "No 25Live instance/base_url in config.yaml.\n"
                         "Copy config.example.yaml to config.yaml and set it.")
                     return
-                cn = main.CollegeNetClient(cfg["collegenet"],
-                                           ZoneInfo(cfg["timezone"]), cfg.get("retry"))
-                ok, detail = cn.check_connection()
+                from bassync.collegenet import CollegeNetClient
+                cn = CollegeNetClient(cfg["collegenet"],
+                                      ZoneInfo(cfg["timezone"]), cfg.get("retry"))
+                try:
+                    ok, detail = cn.check_connection()
+                finally:
+                    cn.close()
                 (messagebox.showinfo if ok else messagebox.showerror)(
                     "Test 25Live", f"{'Connected' if ok else 'FAILED'}\n\n{detail}")
             except Exception as exc:
                 messagebox.showerror("Test 25Live", f"Error: {exc}")
 
-        def _test_niagara(self):
+        def _test_systems(self):
+            """Health-check every system in config.yaml, one line each.
+
+            Reports them all rather than stopping at the first failure — on a
+            mixed campus "BACnet is fine, the supervisor is down" is the useful
+            answer, not "something is broken"."""
             from zoneinfo import ZoneInfo
             try:
-                main, cfg = self._runtime_config()
-                n4 = main.NiagaraClient(cfg["niagara"],
-                                        ZoneInfo(cfg["timezone"]), cfg.get("retry"))
-                ok = n4.health_check()
-                (messagebox.showinfo if ok else messagebox.showerror)(
-                    "Test Niagara",
-                    "Reachable (HTTP 200 from /about)." if ok
-                    else "Unreachable — check niagara host/port/TLS in config.yaml.")
+                _cfgmod, cfg = self._runtime_config()
+                from bassync.drivers import DriverError, build_driver
             except Exception as exc:
-                messagebox.showerror("Test Niagara", f"Error: {exc}")
+                messagebox.showerror("Test BAS connections", f"Error: {exc}")
+                return
+
+            systems = cfg.get("systems") or {}
+            if not systems:
+                messagebox.showwarning(
+                    "Test BAS connections",
+                    "No `systems:` block in config.yaml.\n"
+                    "Copy config.example.yaml to config.yaml and define at "
+                    "least one BAS system.")
+                return
+
+            tz = ZoneInfo(cfg["timezone"])
+            lines, all_ok = [], True
+            for name in sorted(systems):
+                try:
+                    driver = build_driver(name, systems[name], tz, cfg.get("retry"))
+                except DriverError as exc:
+                    lines.append(f"FAIL  {name}: {exc}")
+                    all_ok = False
+                    continue
+                try:
+                    driver.connect()
+                    ok, detail = driver.health_check()
+                except Exception as exc:
+                    ok, detail = False, f"{type(exc).__name__}: {exc}"
+                finally:
+                    driver.close()
+                all_ok = all_ok and ok
+                lines.append(f"{'OK  ' if ok else 'FAIL'}  {name} "
+                             f"({systems[name].get('driver', '?')}): {detail}")
+            self._show_text("Test BAS connections", "\n".join(lines))
+            if not all_ok:
+                messagebox.showwarning(
+                    "Test BAS connections",
+                    "At least one system is unreachable — see the details window.")
 
         def _preview(self):
             import io
@@ -385,7 +499,7 @@ def run_gui(map_path: Path) -> int:
                 if not self._save():
                     return
             try:
-                main, cfg = self._runtime_config()
+                _cfgmod, cfg = self._runtime_config()
                 cfg["space_map_file"] = str(self.path)
                 buf = io.StringIO()
                 handler = _logging.StreamHandler(buf)
@@ -395,7 +509,8 @@ def run_gui(map_path: Path) -> int:
                 prev = root.level
                 root.setLevel(_logging.INFO)
                 try:
-                    main.run_sync(cfg, dry_run=True)
+                    from bassync.sync import run_sync
+                    run_sync(cfg, dry_run=True)
                 finally:
                     root.removeHandler(handler)
                     root.setLevel(prev)
@@ -447,10 +562,11 @@ def run_gui(map_path: Path) -> int:
             nb.add(rooms_tab, text="Rooms")
             self.rooms_tree = self._make_table(
                 rooms_tab,
-                columns=[("space_id", "Space ID", 80),
-                         ("space_name", "Name", 200),
-                         ("building", "Building", 140),
-                         ("niagara_path", "Niagara Path", 210),
+                columns=[("space_id", "Space ID", 75),
+                         ("space_name", "Name", 175),
+                         ("building", "Building", 115),
+                         ("system", "System", 110),
+                         ("target", "Target", 190),
                          ("pre_condition_minutes", "Pre", 45),
                          ("post_buffer_minutes", "Post", 45),
                          ("merge_gap_minutes", "Gap", 45)],
@@ -462,12 +578,13 @@ def run_gui(map_path: Path) -> int:
             nb.add(bld_tab, text="Buildings")
             self.bld_tree = self._make_table(
                 bld_tab,
-                columns=[("id", "ID", 140),
-                         ("name", "Name", 200),
-                         ("niagara_path", "Niagara Path", 210),
+                columns=[("id", "ID", 130),
+                         ("name", "Name", 180),
+                         ("system", "System", 110),
+                         ("target", "Target", 190),
                          ("pre_condition_minutes", "Pre", 45),
                          ("post_buffer_minutes", "Post", 45),
-                         ("space_id", "Bookable space_id", 130)],
+                         ("space_id", "Bookable space_id", 120)],
                 on_add=self._bld_add, on_edit=self._bld_edit,
                 on_delete=self._bld_delete)
 
@@ -516,7 +633,8 @@ def run_gui(map_path: Path) -> int:
             for i, r in enumerate(self.rooms):
                 self.rooms_tree.insert("", "end", iid=str(i), values=(
                     r.get("space_id", ""), r.get("space_name", ""),
-                    r.get("building", "—"), r.get("niagara_path", ""),
+                    r.get("building", "—"), r.get("system", "(inherit)"),
+                    r.get("target", ""),
                     r.get("pre_condition_minutes", ""),
                     r.get("post_buffer_minutes", ""),
                     r.get("merge_gap_minutes", "")))
@@ -526,7 +644,7 @@ def run_gui(map_path: Path) -> int:
             for i, b in enumerate(self.buildings):
                 self.bld_tree.insert("", "end", iid=str(i), values=(
                     b.get("id", ""), b.get("name", ""),
-                    b.get("niagara_path", ""),
+                    b.get("system", "(default)"), b.get("target", ""),
                     b.get("pre_condition_minutes", ""),
                     b.get("post_buffer_minutes", ""),
                     b.get("space_id", "")))
@@ -539,13 +657,26 @@ def run_gui(map_path: Path) -> int:
         def _building_choices(self) -> list[str]:
             return [NONE_LABEL] + [str(b.get("id")) for b in self.buildings]
 
+        def _system_choices(self, inherit_label: str) -> list[str]:
+            """Systems from config.yaml, with an 'inherit' option first.
+
+            A free-text Entry is used instead when config.yaml defines none,
+            so the map can be written before the connection settings exist."""
+            return [inherit_label] + self.systems
+
+        def _system_field(self, label: str, inherit_label: str):
+            if not self.systems:
+                return ("system", label + " (from config.yaml)", "text", None)
+            return ("system", label, "combo", self._system_choices(inherit_label))
+
         # ── room actions ──
         def _room_fields(self):
             return [
                 ("space_id", "25Live Space ID *", "int", None),
                 ("space_name", "Name", "text", None),
                 ("building", "Building", "combo", self._building_choices()),
-                ("niagara_path", "Niagara Path *", "text", None),
+                self._system_field("BAS System", INHERIT_LABEL),
+                ("target", "Target *", "text", None),
                 ("pre_condition_minutes", "Pre-condition minutes", "int", None),
                 ("post_buffer_minutes", "Post-buffer minutes", "int", None),
                 ("merge_gap_minutes", "Merge-gap minutes", "int", None),
@@ -561,8 +692,10 @@ def run_gui(map_path: Path) -> int:
                     return "Space ID is required."
                 if str(values["space_id"]) in existing_ids:
                     return f"Space ID {values['space_id']} is already used by another room."
-                if not values.get("niagara_path"):
-                    return "Niagara Path is required."
+                if not values.get("target"):
+                    return ("Target is required — the schedule's address in "
+                            "its BAS (e.g. \"12001:5\" for BACnet, "
+                            "\"Bldg/Rm101_Occ\" for Niagara).")
                 return None
             return _v
 
@@ -576,6 +709,7 @@ def run_gui(map_path: Path) -> int:
             # "(none)" building -> no building key
             if out.get("building") in (None, NONE_LABEL):
                 out.pop("building", None)
+            _strip_sentinels(out)
             return out
 
         def _room_add(self):
@@ -612,7 +746,8 @@ def run_gui(map_path: Path) -> int:
             return [
                 ("id", "Building ID *", "text", None),
                 ("name", "Name", "text", None),
-                ("niagara_path", "Niagara Path *", "text", None),
+                self._system_field("BAS System", DEFAULT_LABEL),
+                ("target", "Target *", "text", None),
                 ("pre_condition_minutes", "Pre-condition minutes (rooms)", "int", None),
                 ("post_buffer_minutes", "Post-buffer minutes (rooms)", "int", None),
                 ("space_id", "Bookable 25Live space_id", "int", None),
@@ -627,8 +762,10 @@ def run_gui(map_path: Path) -> int:
                     return "Building ID is required."
                 if str(values["id"]) in existing_ids:
                     return f"Building ID '{values['id']}' is already in use."
-                if not values.get("niagara_path"):
-                    return "Niagara Path is required."
+                if not values.get("target"):
+                    return ("Target is required — the schedule's address in "
+                            "its BAS (e.g. \"12001:5\" for BACnet, "
+                            "\"Bldg/Rm101_Occ\" for Niagara).")
                 return None
             return _v
 
@@ -636,6 +773,8 @@ def run_gui(map_path: Path) -> int:
             dlg = FormDialog(self, "Building", self._bld_fields(), values,
                              self._bld_validate(original_index))
             self.wait_window(dlg)
+            if dlg.result is not None:
+                _strip_sentinels(dlg.result)
             return dlg.result
 
         def _bld_add(self):

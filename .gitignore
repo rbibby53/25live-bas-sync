@@ -13,7 +13,7 @@ venv/
 # Editor backups written by editor.py on save
 *.bak
 
-# Logs
+# Logs, and the safety rail's previous-run state
 *.log
 logs/
 

@@ -12,6 +12,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.12"]
+        # The BACnet driver is an optional extra. Run the suite both with and
+        # without BACpypes3 installed, so neither the lazy import nor the
+        # "skipped" path silently rots.
+        bacnet: [ "with-bacnet", "without-bacnet" ]
+    name: py${{ matrix.python-version }} (${{ matrix.bacnet }})
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -20,7 +25,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Install BACpypes3
+        if: matrix.bacnet == 'with-bacnet'
+        run: pip install -r requirements-bacnet.txt
       - name: Byte-compile
-        run: python -m py_compile main.py editor.py Test.py
+        run: python -m compileall -q main.py editor.py Test.py bassync
       - name: Run offline tests
         run: python Test.py
+      - name: CLI smoke test
+        run: |
+          python main.py --list-drivers
+          python main.py --version

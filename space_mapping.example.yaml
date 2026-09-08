@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# space_mapping.example.yaml — 25Live  →  Niagara schedule cross-reference
+# space_mapping.example.yaml — 25Live  →  BAS schedule cross-reference
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Copy this to space_mapping.yaml (or just run editor.py, which creates it):
@@ -14,93 +14,119 @@
 #
 # HOW THE BUILDING CALENDAR IS BUILT
 #   Every room that names a `building` is automatically unioned into that
-#   building's occupancy schedule. So if ANY room in the building is occupied,
-#   the building schedule (hallways, lobbies, common AHUs) runs HVAC too.
-#   You do NOT repeat the building's Niagara path on each room — you just give
-#   the building id. That makes "all rooms in the building" the default and
-#   removes the chance of forgetting to wire one up.
+#   building's occupancy schedule. If ANY room in the building is occupied, the
+#   building schedule (hallways, lobbies, common AHUs) runs too. You do NOT
+#   repeat the building's address on each room — you just give the building id.
+#   That makes "all rooms in the building" the default and removes the chance
+#   of forgetting to wire one up.
+#
+# INHERITANCE
+#   `system`, `pre_condition_minutes` and `post_buffer_minutes` all resolve the
+#   same way:   room override  >  building override  >  global default
+#   An explicit 0 counts as a value at every level, so a room really can turn
+#   pre-conditioning off.
 #
 # ── buildings: fields ──
 #   id            (required)  short key that rooms reference (e.g. social_sciences)
 #   name          (optional)  label for logs
-#   niagara_path  (required)  the building roll-up schedule slot, RELATIVE to
-#                             niagara.schedule_base_path in config.yaml
-#                             (default slot:/Schedules)
-#   pre_condition_minutes (optional)  building-wide run-up default for ITS rooms;
-#                             beats the global default but a room can still
-#                             override it (precedence: room > building > global)
+#   system        (optional)  which BAS this schedule lives on — a key from
+#                             `systems:` in config.yaml. Omit for default_system.
+#                             Its rooms inherit this.
+#   target        (required)  the building roll-up schedule's address in that
+#                             system (syntax below)
+#   pre_condition_minutes (optional)  building-wide run-up default for ITS rooms
 #   post_buffer_minutes   (optional)  building-wide run-down default for ITS rooms
-#                             (same precedence)
-#   space_id      (optional)  ONLY if the building common area is itself bookable
-#                             in 25Live (e.g. an atrium); its own events then also
-#                             count toward the building schedule
+#   space_id      (optional)  ONLY if the building common area is itself
+#                             bookable in 25Live (e.g. an atrium); its own
+#                             events then also count toward the building schedule
 #
 # ── spaces: (room) fields ──
-#   space_id              (required)  25Live numeric space id (from the space's
-#                                     URL / detail in 25Live -> Locations)
+#   space_id              (required)  25Live numeric space id, from the space's
+#                                     URL in 25Live → Locations, or `--discover`
 #   space_name            (optional)  label for logs; defaults to the id
 #   building              (optional)  id of the building this room rolls into.
-#                                     Omit for a room that should run on its own
-#                                     and NOT drive any building schedule.
-#   niagara_path          (required)  this room's own schedule slot
-#   pre_condition_minutes (optional)  HVAC lead time BEFORE events. Precedence:
-#                                     room > building > global default (30)
-#   post_buffer_minutes   (optional)  hold time AFTER events. Precedence:
-#                                     room > building > global default (15)
+#                                     Omit for a room that runs on its own.
+#   system                (optional)  overrides the building's system
+#   target                (required)  this room's own schedule address
+#   pre_condition_minutes (optional)  HVAC lead time BEFORE events
+#   post_buffer_minutes   (optional)  hold time AFTER events
 #   merge_gap_minutes     (optional)  collapse this room's back-to-back windows
-#                                     that are within this many minutes
-#                                     (default 5). Merges ACROSS rooms (the
-#                                     building roll-up) use the global default;
-#                                     a room's own gap still shapes the windows
-#                                     it contributes to its building.
+#                                     within this many minutes (default 5).
+#                                     Merges ACROSS rooms (the building roll-up)
+#                                     use the global default.
+#   note                  (optional)  free text; the sync ignores it, and the
+#                                     editor preserves it across saves
 #
-# To add a room: copy a block, set space_id / niagara_path / building. Done —
-# it joins its building's roll-up automatically.
+# ── target syntax, by driver ──
+#   bacnet    "12001:5"              device instance : Schedule object instance
+#             "12001:5@10.4.2.30"    pin the address, skipping Who-Is
+#   niagara   "Bldg/Rm101_Occ"       ORD relative to schedule_base_path
+#             "slot:/Other/Sched"    an absolute ORD is used as-is
+#   rest      whatever your configured path template expects
+#
+# Pre-2.0 maps used `niagara_path:` instead of `target:`. That still works —
+# nothing needs rewriting — and the editor renames it when you next save.
 # ─────────────────────────────────────────────────────────────────────────────
 
 buildings:
 
+  # A building on the campus BACnet network. Its Schedule object lives in the
+  # building controller at device 12001, object instance 100.
   - id: social_sciences
     name: "Social Sciences"
-    niagara_path: "SocialSciences/Building_Occ"
+    system: campus_bacnet
+    target: "12001:100"
 
   - id: eng_tech
     name: "Engineering Technology"
-    niagara_path: "EngTech/Building_Occ"
-    pre_condition_minutes: 40   # whole building warms up early; rooms may override
+    system: campus_bacnet
+    target: "12050:100@10.4.2.30"   # address pinned: no Who-Is broadcast needed
+    pre_condition_minutes: 40       # whole building warms up early; rooms may override
     post_buffer_minutes: 20
 
+  # A building still on the Niagara supervisor rather than direct BACnet.
   - id: student_center
     name: "Student Center"
-    niagara_path: "StudentCenter/Building_Occ"
-    space_id: 9001            # the atrium is itself bookable in 25Live
+    system: supervisor
+    target: "StudentCenter/Building_Occ"
+    space_id: 9001                  # the atrium is itself bookable in 25Live
 
 
 spaces:
 
-  # Two rooms in Social Sciences — BOTH automatically feed SocialSciences/Building_Occ.
-  # Either one being booked turns on the building (hallway/lobby) HVAC.
+  # Two rooms in Social Sciences — BOTH automatically feed 12001:100. Either
+  # one being booked turns on the building (hallway/lobby) HVAC.
   - space_id: 1234
     space_name: "Social Sciences 1021"
     building: social_sciences
-    niagara_path: "SocialSciences/Rm1021_Occ"
-    pre_condition_minutes: 45        # large lecture hall — longer warm-up
+    target: "12001:5"
+    pre_condition_minutes: 45       # large lecture hall — longer warm-up
     post_buffer_minutes: 15
 
   - space_id: 1235
     space_name: "Social Sciences 1022"
     building: social_sciences
-    niagara_path: "SocialSciences/Rm1022_Occ"
+    target: "12001:6"
 
-  # A lab in Engineering Tech — rolls into EngTech/Building_Occ.
+  # A lab in Engineering Tech — inherits the building's 40-minute run-up.
   - space_id: 2050
     space_name: "Engineering Tech 110 Lab"
     building: eng_tech
-    niagara_path: "EngTech/Rm110_Occ"
-    pre_condition_minutes: 60        # fume-hood lab — long pre-conditioning
-    merge_gap_minutes: 30            # keep HVAC on between closely-spaced labs
+    target: "12050:5@10.4.2.30"
+    pre_condition_minutes: 60       # fume-hood lab — longer still
+    merge_gap_minutes: 30           # keep HVAC on between closely-spaced labs
 
-  # A room that should run on its own only (no building roll-up): omit `building`.
-  # - space_id: 3000
-  #   space_name: "Standalone Annex"
-  #   niagara_path: "Annex/Rm1_Occ"
+  # A room in a building on the supervisor. It inherits system: supervisor, so
+  # its target is a Niagara ORD rather than a BACnet object id.
+  - space_id: 9010
+    space_name: "Student Center Ballroom"
+    building: student_center
+    target: "StudentCenter/Ballroom_Occ"
+
+  # A room being commissioned: same map, but pointed at the `preview` system so
+  # it only logs until you're ready to cut it over.
+  - space_id: 3000
+    space_name: "Annex 101 (commissioning)"
+    system: not_yet_live
+    target: "Annex/Rm101_Occ"
+    note: "Cut over once the AHU-3 occupancy logic is wired — RB 2026-09"
