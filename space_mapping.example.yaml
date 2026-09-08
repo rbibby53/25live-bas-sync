@@ -13,20 +13,41 @@
 #   floors:     optional per-floor corridor schedules (building + level).
 #   spaces:     the rooms; each names its building and optionally its floor.
 #
-# HOW THE BUILDING CALENDAR IS BUILT
-#   Every room that names a `building` is automatically unioned into that
-#   building's occupancy schedule. If ANY room in the building is occupied, the
-#   building schedule (hallways, lobbies, common AHUs) runs too. You do NOT
-#   repeat the building's address on each room — you just give the building id.
-#   That makes "all rooms in the building" the default and removes the chance
-#   of forgetting to wire one up.
 #
-# PER-FLOOR CORRIDORS (room -> floor -> building)
-#   Give a room a `floor:` and define that floor under `floors:`, and the room
-#   ALSO drives its floor's corridor schedule. That is what keeps a single
-#   evening booking on the third floor from conditioning the whole tower, while
-#   still lighting and tempering the corridor someone has to walk down. A room
-#   with no `floor:` still rolls up to its building exactly as before.
+# HOW OCCUPANCY ROLLS UP:  room  →  floor  →  building
+#
+#   A booked room drives its own schedule (if it has one), its floor's corridor
+#   (if it names a floor), and its building's common areas. You never repeat a
+#   building's address on a room — you just give the building id, which makes
+#   "all rooms in the building" the default and removes the chance of
+#   forgetting to wire one up.
+#
+#
+# HOW FINELY CAN YOU SCHEDULE?  IT DEPENDS ON THE BUILDING.
+#
+#   This is the thing to get right, and it is not the same campus-wide. How
+#   granular you can be is decided by how the building was built out, not by
+#   this tool:
+#
+#     PER ROOM     The room has its own schedulable object — a room-level VAV
+#                  or FCU with its own occupancy schedule. Give the room a
+#                  `target:`. Typical of Automated Logic WebCTRL sites, where
+#                  scheduling is normally done per room.
+#
+#     PER FLOOR    The building was brought online with floor-level air
+#                  handling, so the finest real control is the corridor/floor
+#                  AHU. Give the room a `building:` and a `floor:`, and NO
+#                  `target:`. Its bookings drive the floor and the building.
+#
+#     PER BUILDING The oldest wings: one air handler for the whole building.
+#                  Give the room a `building:` and no `floor:` or `target:`.
+#                  Its bookings drive the building schedule.
+#
+#   A room with no `target:` is a normal, supported mapping — it contributes
+#   its bookings to whatever roll-ups it belongs to and writes no schedule of
+#   its own. A room with no `target:` AND no `building:` is an error, because
+#   its bookings would drive nothing at all.
+#
 #
 # INHERITANCE
 #   `system`, `pre_condition_minutes` and `post_buffer_minutes` all resolve the
@@ -34,37 +55,43 @@
 #   An explicit 0 counts as a value at every level, so a room really can turn
 #   pre-conditioning off.
 #
+#
 # ── buildings: fields ──
 #   id            (required)  short key that rooms reference (e.g. social_sciences)
 #   name          (optional)  label for logs
 #   system        (optional)  which BAS this schedule lives on — a key from
-#                             `systems:` in config.yaml. Omit for default_system.
-#                             Its rooms inherit this.
-#   target        (required)  the building roll-up schedule's address in that
-#                             system (syntax below)
+#                             `systems:` in config.yaml. Omit for
+#                             `default_system`. Its rooms and floors inherit it.
+#   target        (required)  the building roll-up schedule's address
 #   pre_condition_minutes (optional)  building-wide run-up default for ITS rooms
 #   post_buffer_minutes   (optional)  building-wide run-down default for ITS rooms
 #   space_id      (optional)  ONLY if the building common area is itself
 #                             bookable in 25Live (e.g. an atrium); its own
 #                             events then also count toward the building schedule
 #
+# ── floors: fields ──
+#   building      (required)  the building id these floors belong to
+#   level         (required)  floor number, matching a room's `floor:`
+#   system        (optional)  defaults to the building's system
+#   target        (required)  the corridor schedule's address
+#
 # ── spaces: (room) fields ──
 #   space_id              (required)  25Live numeric space id, from the space's
 #                                     URL in 25Live → Locations, or `--discover`
 #   space_name            (optional)  label for logs; defaults to the id
-#   building              (optional)  id of the building this room rolls into.
-#                                     Omit for a room that runs on its own.
+#   building              (optional)  id of the building this room rolls into
 #   floor                 (optional)  floor number; with a matching `floors:`
-#                                     entry the room also drives that floor's
-#                                     corridor schedule
+#                                     entry the room also drives that corridor
 #   system                (optional)  overrides the building's system
-#   target                (required)  this room's own schedule address
+#   target                (optional)  this room's own schedule address. OMIT for
+#                                     a building scheduled per floor or per
+#                                     building — see above.
 #   pre_condition_minutes (optional)  HVAC lead time BEFORE events
 #   post_buffer_minutes   (optional)  hold time AFTER events
 #   merge_gap_minutes     (optional)  collapse this room's back-to-back windows
 #                                     within this many minutes (default 5).
-#                                     Merges ACROSS rooms (the building roll-up)
-#                                     use the global default.
+#                                     Merges ACROSS rooms (the roll-ups) use
+#                                     the global default.
 #   note                  (optional)  free text; the sync ignores it, and the
 #                                     editor preserves it across saves
 #
@@ -81,87 +108,112 @@
 
 buildings:
 
-  # A building on the campus BACnet network. Its Schedule object lives in the
-  # building controller at device 12001, object instance 100.
-  - id: social_sciences
-    name: "Social Sciences"
-    system: campus_bacnet
-    target: "12001:100"
+  # ── PER-ROOM building (WebCTRL) ──
+  # Room-level controls, so each room gets its own schedule object.
+  - id: science_hall
+    name: "Science Hall"
+    system: webctrl
+    target: "12100:100"
 
-  - id: eng_tech
-    name: "Engineering Technology"
-    system: campus_bacnet
-    target: "12050:100@10.4.2.30"   # address pinned: no Who-Is broadcast needed
-    pre_condition_minutes: 40       # whole building warms up early; rooms may override
-    post_buffer_minutes: 20
+  # ── PER-FLOOR building ──
+  # Brought online with floor-level air handling: the corridor AHU is the
+  # finest real control, so rooms here carry a `floor:` and no `target:`.
+  - id: liberal_arts
+    name: "Liberal Arts"
+    system: webctrl
+    target: "12200:100"
+    pre_condition_minutes: 40      # bigger air handler, longer run-up
 
-  # A building still on the Niagara supervisor rather than direct BACnet.
+  # ── PER-BUILDING wing (EcoStruxure) ──
+  # One air handler for the whole building. Rooms drive the building only.
+  - id: heritage_hall
+    name: "Heritage Hall"
+    system: ebo_campus
+    target: "12300:100@10.4.9.20"
+    pre_condition_minutes: 60      # old building, slow to come up
+    post_buffer_minutes: 30
+
+  # A building still on the Niagara supervisor, not yet cut over to BACnet.
   - id: student_center
     name: "Student Center"
     system: supervisor
     target: "StudentCenter/Building_Occ"
-    space_id: 9001                  # the atrium is itself bookable in 25Live
+    space_id: 9001                 # the atrium is itself bookable in 25Live
 
 
-# ── floors: fields (all optional as a section) ──
-#   building  (required)  the building id these floors belong to
-#   level     (required)  floor number, matching a room's `floor:`
-#   system    (optional)  defaults to the building's system
-#   target    (required)  the corridor schedule's address
 floors:
 
-  - building: social_sciences
+  # Only the per-floor building needs these.
+  - building: liberal_arts
     level: 1
-    target: "12001:110"
+    target: "12200:110"
 
-  - building: social_sciences
+  - building: liberal_arts
     level: 2
-    target: "12001:120"
+    target: "12200:120"
 
-  # A corridor still on the Niagara supervisor even though its building sits on
-  # BACnet — `system:` overrides per floor when a retrofit is only part done.
-  - building: student_center
-    level: 1
-    target: "StudentCenter/Floor1_Corridor"
+  - building: liberal_arts
+    level: 3
+    target: "12200:130"
 
 
 spaces:
 
-  # Two rooms in Social Sciences — BOTH automatically feed 12001:100. Either
-  # one being booked turns on the building (hallway/lobby) HVAC.
+  # ── PER ROOM: each has its own schedule object. ──
   - space_id: 1234
-    space_name: "Social Sciences 1021"
-    building: social_sciences
-    floor: 1                        # also drives 12001:110, the floor-1 corridor
-    target: "12001:5"
-    pre_condition_minutes: 45       # large lecture hall — longer warm-up
-    post_buffer_minutes: 15
+    space_name: "Science Hall 1021"
+    building: science_hall
+    target: "12100:5"
+    pre_condition_minutes: 45      # large lecture hall — longer warm-up
 
   - space_id: 1235
-    space_name: "Social Sciences 1022"
-    building: social_sciences
+    space_name: "Science Hall 1022"
+    building: science_hall
+    target: "12100:6"
+
+  - space_id: 1240
+    space_name: "Science Hall 210 Lab"
+    building: science_hall
+    target: "12100:12"
+    pre_condition_minutes: 60      # fume-hood lab — long pre-conditioning
+    merge_gap_minutes: 30          # keep HVAC on between closely-spaced labs
+
+  # ── PER FLOOR: no `target:`. These drive 12200:120 and 12200:100. ──
+  - space_id: 2201
+    space_name: "Liberal Arts 201"
+    building: liberal_arts
     floor: 2
-    target: "12001:6"
 
-  # A lab in Engineering Tech — inherits the building's 40-minute run-up.
-  - space_id: 2050
-    space_name: "Engineering Tech 110 Lab"
-    building: eng_tech
-    target: "12050:5@10.4.2.30"
-    pre_condition_minutes: 60       # fume-hood lab — longer still
-    merge_gap_minutes: 30           # keep HVAC on between closely-spaced labs
+  - space_id: 2202
+    space_name: "Liberal Arts 202"
+    building: liberal_arts
+    floor: 2
 
-  # A room in a building on the supervisor. It inherits system: supervisor, so
-  # its target is a Niagara ORD rather than a BACnet object id.
+  - space_id: 2301
+    space_name: "Liberal Arts 301"
+    building: liberal_arts
+    floor: 3
+
+  # ── PER BUILDING: no `target:` and no `floor:`. Drives 12300:100 only. ──
+  - space_id: 3101
+    space_name: "Heritage Hall 101"
+    building: heritage_hall
+
+  - space_id: 3102
+    space_name: "Heritage Hall 102"
+    building: heritage_hall
+    note: "Ballroom — check whether AHU-1 can be split before adding a target"
+
+  # ── A room on the Niagara supervisor, addressed by ORD. ──
   - space_id: 9010
     space_name: "Student Center Ballroom"
     building: student_center
     target: "StudentCenter/Ballroom_Occ"
 
-  # A room being commissioned: same map, but pointed at the `preview` system so
-  # it only logs until you're ready to cut it over.
-  - space_id: 3000
+  # ── Commissioning: same map, pointed at the `preview` system so it only
+  #    logs until you are ready to cut it over. ──
+  - space_id: 4000
     space_name: "Annex 101 (commissioning)"
     system: not_yet_live
     target: "Annex/Rm101_Occ"
-    note: "Cut over once the AHU-3 occupancy logic is wired — RB 2026-09"
+    note: "Cut over once the AHU-3 occupancy logic is wired"

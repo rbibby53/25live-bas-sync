@@ -1402,7 +1402,10 @@ def run_gui(map_path: Path) -> int:
                 lambda r: (r.get("space_id", ""), r.get("space_name", ""),
                            r.get("building", "—"), r.get("floor", ""),
                            r.get("system", "(inherit)"),
-                           r.get("target", ""),
+                           # Blank means "no schedule of its own" — a normal
+                           # mapping for a floor- or building-scheduled wing.
+                           # Spell it out so it doesn't read as a missing field.
+                           r.get("target") or "(roll-up only)",
                            r.get("pre_condition_minutes", ""),
                            r.get("post_buffer_minutes", ""),
                            r.get("merge_gap_minutes", "")),
@@ -1479,7 +1482,7 @@ def run_gui(map_path: Path) -> int:
                 ("building", "Building", "combo", self._building_choices()),
                 ("floor", "Floor # (per-floor hallway)", "int", self._floor_choices()),
                 self._system_field(INHERIT_LABEL),
-                ("target", "Target *", "text", None),
+                ("target", "Target (blank = roll-up only)", "text", None),
                 ("pre_condition_minutes", "Pre-condition minutes", "int", None),
                 ("post_buffer_minutes", "Post-buffer minutes", "int", None),
                 ("merge_gap_minutes", "Merge-gap minutes", "int", None),
@@ -1495,10 +1498,15 @@ def run_gui(map_path: Path) -> int:
                     return "Space ID is required."
                 if str(values["space_id"]) in existing_ids:
                     return f"Space ID {values['space_id']} is already used by another room."
-                if not values.get("target"):
-                    return ("Target is required — the schedule's address in its "
-                            "BAS (e.g. \"12001:5\" for BACnet, "
-                            "\"Bldg/Rm101_Occ\" for Niagara).")
+                # A blank target is normal for a building that can only be
+                # scheduled per floor or per air handler — the room still feeds
+                # its roll-ups. What it must not do is drive nothing at all.
+                if not values.get("target") and not values.get("building"):
+                    return ("This room has no Target and no Building, so its "
+                            "bookings would drive nothing.\n\n"
+                            "Either give it a Target (its own schedule — e.g. "
+                            "\"12001:5\" for BACnet), or a Building to roll "
+                            "up into (optionally with a Floor).")
                 return None
             return _v
 

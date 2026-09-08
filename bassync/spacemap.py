@@ -35,6 +35,35 @@ from .config import ConfigError, read_yaml
 from .model import Destination, SpaceConfig
 
 
+class RowError(ValueError):
+    """A single row in the room map is unusable. Carries a message for the
+    errors list so one bad room is reported, not raised — the other 400 rooms
+    should still sync."""
+
+
+def _space_id(value) -> str:
+    """
+    Normalise a 25Live space id to the string form the API returns.
+
+    YAML reads an unquoted `1234` as int and `1234.0` as float; str() on the
+    latter gives "1234.0", which would never match the "1234" 25Live sends, and
+    the room would silently never sync. Integral floats are folded back to int.
+    """
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _require_int(value, what: str, where: str) -> int:
+    """int(value) or a RowError naming the field — a typo'd number is a
+    reportable mapping mistake, not a traceback."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise RowError(f"{where}: `{what}` must be a whole number, got "
+                       f"{value!r}.") from None
+
+
 def _int_or_default(value, default: int) -> int:
     """
     Return the configured value, falling back to `default` only when it is
@@ -46,6 +75,13 @@ def _int_or_default(value, default: int) -> int:
     conditioning half an hour before every booking.
     """
     return default if value is None else int(value)
+
+
+def _int_or_default_checked(value, default: int, what: str, where: str) -> int:
+    """_int_or_default, but reporting a bad value instead of raising."""
+    if value is None:
+        return default
+    return _require_int(value, what, where)
 
 
 def _resolve(room_value, building_value, default):
@@ -60,22 +96,26 @@ def _resolve(room_value, building_value, default):
     return default
 
 
-def _target_of(row: dict, what: str, where: str,
-               errors: list) -> Optional[str]:
+def _target_of(row: dict) -> Optional[str]:
     """
-    The schedule address for a row.
+    The schedule address for a row, or None when it has none.
 
     `target:` is the current key. `niagara_path:` is the pre-1.0 name and is
-    still accepted verbatim, so an existing campus map keeps working after the
+    still accepted verbatim, so an existing campus map keeps working after an
     upgrade without a mass edit.
+
+    Returning None is meaningful rather than an error: a room in a building
+    that can only be scheduled at the floor or air-handler level has no
+    schedule of its own, and still contributes its bookings to its roll-ups.
+    Buildings and floors, which exist *only* to be a schedule, are checked by
+    their callers.
     """
     target = row.get("target")
     if target in (None, ""):
         target = row.get("niagara_path")
     if target in (None, ""):
-        errors.append(f"{what} {where}: no `target:` (or legacy `niagara_path:`).")
         return None
-    return str(target)
+    return str(target).strip() or None
 
 
 class SpaceMap:
@@ -106,8 +146,7 @@ class SpaceMap:
         """
         out = set()
         for sc in self.spaces.values():
-            out.add(sc.destination)
-            out.update(sc.rollup_destinations())
+            out.update(sc.all_destinations())
         return out
 
     def systems_used(self) -> set:
@@ -149,6 +188,9 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
     buildings: dict = {}
     building_dest: dict = {}
     for b in (data.get("buildings") or []):
+        if not isinstance(b, dict):
+            errors.append(f"A `buildings:` entry is not a mapping: {b!r}")
+            continue
         bid = str(b.get("id") or "").strip()
         if not bid:
             errors.append("A building has no `id:`.")
@@ -157,9 +199,14 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
             errors.append(f"Building id '{bid}' is defined more than once.")
             continue
         buildings[bid] = b
-        target = _target_of(b, "Building", bid, errors)
+        target = _target_of(b)
         system = str(_resolve(b.get("system"), None, default_system) or "")
-        if target is not None:
+        if target is None:
+            errors.append(
+                f"Building {bid}: no `target:` — a building entry exists to "
+                "name its roll-up schedule, so it needs one. Rooms may omit "
+                "`target:`; buildings may not.")
+        else:
             if not system:
                 errors.append(
                     f"Building {bid}: no `system:` and no default. Set "
@@ -186,19 +233,19 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
             continue
         building_id = str(raw_building)
         try:
-            level = int(raw_level)
-        except (TypeError, ValueError):
-            errors.append(
-                f"Floor entry for building '{building_id}' has a non-numeric "
-                f"level {raw_level!r}.")
+            level = _require_int(raw_level, "level", f"Floor of '{building_id}'")
+        except RowError as exc:
+            errors.append(str(exc))
             continue
         if building_id not in buildings:
             errors.append(
                 f"Floor {level} references unknown building '{building_id}'.")
             continue
 
-        target = _target_of(f, "Floor", f"{building_id} level {level}", errors)
+        target = _target_of(f)
         if target is None:
+            errors.append(f"Floor {level} of '{building_id}': no `target:` — a "
+                          "floor entry exists to name its corridor schedule.")
             continue
         # A floor inherits its building's system unless it says otherwise —
         # a corridor is served by the same panel as the rooms off it far more
@@ -234,14 +281,15 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
 
     # ── 2) Rooms ─────────────────────────────────────────────────────────────
     for row in (data.get("spaces") or []):
+        if not isinstance(row, dict):
+            errors.append(f"A `spaces:` entry is not a mapping: {row!r}")
+            continue
         raw_id = row.get("space_id")
         if raw_id in (None, ""):
             errors.append(f"A room has no `space_id:` ({row.get('space_name', '?')}).")
             continue
-        space_id = str(raw_id)
-        target = _target_of(row, "Room", space_id, errors)
-        if target is None:
-            continue
+        space_id = _space_id(raw_id)
+        where = f"Room {space_id}"
 
         building = None
         bdest = None
@@ -251,9 +299,8 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
             building = buildings.get(building_id)
             if building is None:
                 warnings.append(
-                    f"Room {space_id} references unknown building "
-                    f"'{building_id}' — it will NOT roll up. Add it under "
-                    "buildings: or fix the name.")
+                    f"{where} references unknown building '{building_id}' — it "
+                    "will NOT roll up. Add it under buildings: or fix the name.")
             else:
                 bdest = building_dest.get(building_id)
 
@@ -264,57 +311,77 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
         fdest = None
         if row.get("floor") not in (None, ""):
             try:
-                floor = int(row["floor"])
-            except (TypeError, ValueError):
-                warnings.append(
-                    f"Room {space_id} has a non-numeric floor "
-                    f"{row['floor']!r} — ignoring it.")
+                floor = _require_int(row["floor"], "floor", where)
+            except RowError as exc:
+                warnings.append(f"{exc} Ignoring the floor.")
             if floor is not None:
                 if building_id in (None, ""):
                     warnings.append(
-                        f"Room {space_id} names floor {floor} but no building, "
-                        "so there is nothing to look the floor up against — it "
-                        "will NOT drive a corridor schedule.")
+                        f"{where} names floor {floor} but no building, so there "
+                        "is nothing to look the floor up against — it will NOT "
+                        "drive a corridor schedule.")
                 else:
                     fdest = floor_dest.get((str(building_id), floor))
                     if fdest is None:
                         warnings.append(
-                            f"Room {space_id} references floor {floor} of "
-                            f"building '{building_id}' with no matching floors: "
-                            "entry — it will NOT drive a corridor schedule.")
+                            f"{where} references floor {floor} of building "
+                            f"'{building_id}' with no matching floors: entry — "
+                            "it will NOT drive a corridor schedule.")
 
         bld = building or {}
         system = str(_resolve(row.get("system"), bld.get("system"),
                               default_system) or "")
         if not system:
             errors.append(
-                f"Room {space_id}: no `system:` and no default. Set "
-                "`default_system:` in config.yaml or name one per room.")
+                f"{where}: no `system:` and no default. Set `default_system:` "
+                "in config.yaml or name one per room.")
             continue
         if known_systems and system not in known_systems:
             errors.append(
-                f"Room {space_id}: system '{system}' is not defined under "
-                f"`systems:` in config.yaml. Known: "
+                f"{where}: system '{system}' is not defined under `systems:` in "
+                f"config.yaml. Known: "
                 f"{', '.join(sorted(known_systems)) or '(none)'}.")
             continue
 
-        _register(space_id, SpaceConfig(
-            space_id=space_id,
-            space_name=str(row.get("space_name") or space_id),
-            space_type="room",
-            destination=Destination(system=system, target=target),
-            building_destination=bdest,
-            pre_condition_minutes=int(_resolve(
-                row.get("pre_condition_minutes"),
-                bld.get("pre_condition_minutes"), default_pre)),
-            post_buffer_minutes=int(_resolve(
-                row.get("post_buffer_minutes"),
-                bld.get("post_buffer_minutes"), default_post)),
-            merge_gap_minutes=_int_or_default(
-                row.get("merge_gap_minutes"), default_gap),
-            floor=floor,
-            floor_destination=fdest,
-        ), f"room {row.get('space_name', space_id)}")
+        # A room without its own `target:` is normal: plenty of buildings can
+        # only be scheduled at the floor or air-handler level. It still feeds
+        # its roll-ups. What is NOT useful is a room that drives nothing at
+        # all — that room's bookings would vanish silently, so say so.
+        target = _target_of(row)
+        rdest = Destination(system=system, target=target) if target else None
+        if rdest is None and bdest is None and fdest is None:
+            errors.append(
+                f"{where}: no `target:` and no roll-up to contribute to, so its "
+                "bookings would drive nothing. Give it a `target:`, or a "
+                "`building:` (and optionally `floor:`) to roll up into.")
+            continue
+
+        try:
+            space = SpaceConfig(
+                space_id=space_id,
+                space_name=str(row.get("space_name") or space_id),
+                space_type="room",
+                destination=rdest,
+                building_destination=bdest,
+                pre_condition_minutes=_require_int(
+                    _resolve(row.get("pre_condition_minutes"),
+                             bld.get("pre_condition_minutes"), default_pre),
+                    "pre_condition_minutes", where),
+                post_buffer_minutes=_require_int(
+                    _resolve(row.get("post_buffer_minutes"),
+                             bld.get("post_buffer_minutes"), default_post),
+                    "post_buffer_minutes", where),
+                merge_gap_minutes=_int_or_default_checked(
+                    row.get("merge_gap_minutes"), default_gap,
+                    "merge_gap_minutes", where),
+                floor=floor,
+                floor_destination=fdest,
+            )
+        except RowError as exc:
+            errors.append(str(exc))
+            continue
+
+        _register(space_id, space, f"room {row.get('space_name', space_id)}")
 
     # ── 3) Buildings that are themselves bookable in 25Live ──────────────────
     #     e.g. an atrium with its own 25Live space. Its own events then count
@@ -325,20 +392,29 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
         dest = building_dest.get(building_id)
         if dest is None:
             continue
-        space_id = str(b["space_id"])
-        _register(space_id, SpaceConfig(
-            space_id=space_id,
-            space_name=str(b.get("name") or building_id),
-            space_type="building",
-            destination=dest,
-            building_destination=None,
-            pre_condition_minutes=_int_or_default(
-                b.get("pre_condition_minutes"), default_pre),
-            post_buffer_minutes=_int_or_default(
-                b.get("post_buffer_minutes"), default_post),
-            merge_gap_minutes=_int_or_default(
-                b.get("merge_gap_minutes"), default_gap),
-        ), f"building {building_id}")
+        space_id = _space_id(b["space_id"])
+        where = f"Building {building_id}"
+        try:
+            space = SpaceConfig(
+                space_id=space_id,
+                space_name=str(b.get("name") or building_id),
+                space_type="building",
+                destination=dest,
+                building_destination=None,
+                pre_condition_minutes=_int_or_default_checked(
+                    b.get("pre_condition_minutes"), default_pre,
+                    "pre_condition_minutes", where),
+                post_buffer_minutes=_int_or_default_checked(
+                    b.get("post_buffer_minutes"), default_post,
+                    "post_buffer_minutes", where),
+                merge_gap_minutes=_int_or_default_checked(
+                    b.get("merge_gap_minutes"), default_gap,
+                    "merge_gap_minutes", where),
+            )
+        except RowError as exc:
+            errors.append(str(exc))
+            continue
+        _register(space_id, space, f"building {building_id}")
 
     # ── 4) Two rooms pointing at one schedule ────────────────────────────────
     #     Legal and sometimes intentional (an air-wall room split into A/B in
@@ -347,7 +423,7 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
     #     copy-paste slip.
     seen: dict = {}
     for sc in space_map.values():
-        if sc.space_type != "room":
+        if sc.space_type != "room" or sc.destination is None:
             continue
         seen.setdefault(sc.destination, []).append(sc.space_id)
     for dest, ids in seen.items():
@@ -357,9 +433,12 @@ def load_space_map(path: str, cfg: dict) -> SpaceMap:
                 f"({', '.join(sorted(ids))}). Their bookings are unioned — "
                 "intended for a divisible room, a mistake otherwise.")
 
-    n_rooms = sum(1 for s in space_map.values() if s.space_type == "room")
-    logging.info("Loaded %d rooms across %d buildings (%d floor schedules) from %s",
-                 n_rooms, len(buildings), len(floor_dest), path)
+    rooms = [s for s in space_map.values() if s.space_type == "room"]
+    rollup_only = sum(1 for s in rooms if s.destination is None)
+    logging.info(
+        "Loaded %d rooms (%d roll-up only) across %d buildings, %d floor "
+        "schedules, from %s",
+        len(rooms), rollup_only, len(buildings), len(floor_dest), path)
     for w in warnings:
         logging.warning("%s", w)
     return SpaceMap(space_map, errors, warnings,

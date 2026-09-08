@@ -4,11 +4,11 @@
 """
 Vendor-neutral BACnet/IP driver — writes ASHRAE 135 Schedule objects.
 
-This is the driver to reach for first on a mixed campus. Tridium Niagara,
-Automated Logic WebCTRL and Schneider EcoStruxure Building Operation are all
-BTL-listed and all expose standard Schedule objects (Object_Type 17), so one
-code path drives every one of them. No vendor SDK, no per-version REST
-contract to chase.
+This is the driver to reach for first on a mixed campus. Automated Logic
+WebCTRL, Schneider EcoStruxure Building Operation, Tridium Niagara and any
+other BTL-listed controller are all required to expose standard Schedule
+objects (Object_Type 17), so one code path drives every one of them. No vendor
+SDK, no per-version REST contract to chase.
 
 What it writes
 --------------
@@ -54,7 +54,7 @@ the schedule commands its listed points). This driver never changes
 Requirements
 ------------
 `pip install bacpypes3` (or `pip install -r requirements-bacnet.txt`). The
-import is lazy, so a Niagara-only or WebCTRL-only site never needs it.
+import is lazy, so a site using only the HTTP drivers never needs it.
 """
 
 import asyncio
@@ -65,6 +65,7 @@ from datetime import date as _date, datetime
 from typing import Optional
 
 from .base import DriverError, ScheduleWriter
+from ..model import OccupancyWindow
 
 # Default BACnet/IP UDP port (0xBAC0).
 DEFAULT_BACNET_PORT = 47808
@@ -81,6 +82,12 @@ WHO_IS_TIMEOUT = 5.0
 # `local_address` makes a nightly run hang forever instead of failing — which
 # is strictly worse, because a hung job never alerts.
 CONNECT_TIMEOUT = 10.0
+
+# BACnet object instance numbers are 22-bit. 4194303 is reserved to mean
+# "unconfigured" in a Device object, so a target naming it is a mistake — it is
+# what an out-of-the-box controller reports before commissioning.
+MAX_INSTANCE = 4194302
+UNCONFIGURED_INSTANCE = 4194303
 
 # target: "<device>:<schedule>" with an optional "@address[:port]" suffix.
 _TARGET_RE = re.compile(
@@ -116,7 +123,20 @@ def parse_target(target: str) -> BacnetTarget:
     address = m.group("address")
     if address and ":" not in address:
         address = f"{address}:{DEFAULT_BACNET_PORT}"
-    return BacnetTarget(int(m.group("device")), int(m.group("schedule")), address)
+    device_id = int(m.group("device"))
+    schedule_instance = int(m.group("schedule"))
+    for value, what in ((device_id, "device"), (schedule_instance, "schedule")):
+        if value == UNCONFIGURED_INSTANCE:
+            raise DriverError(
+                f"BACnet target {target!r}: {what} instance "
+                f"{UNCONFIGURED_INSTANCE} is the reserved 'unconfigured' value "
+                "— it is what a controller reports before commissioning, not a "
+                "real address.")
+        if value > MAX_INSTANCE:
+            raise DriverError(
+                f"BACnet target {target!r}: {what} instance {value} is above "
+                f"the maximum {MAX_INSTANCE} (instances are 22-bit).")
+    return BacnetTarget(device_id, schedule_instance, address)
 
 
 def windows_to_daily(windows: list, tz) -> "dict[_date, list[tuple[datetime, bool]]]":
@@ -131,11 +151,17 @@ def windows_to_daily(windows: list, tz) -> "dict[_date, list[tuple[datetime, boo
     a BACnet time cannot be 24:00, and at midnight the controller re-evaluates
     against the next day's exception (or falls back to the weekly schedule)
     anyway, so the trailing OFF would be both illegal and redundant.
+
+    Windows are converted to the device's zone BEFORE being split, because the
+    midnight they must be split at is the controller's, not the campus's. Doing
+    it the other way round on a building in another timezone produced a window
+    that turned ON and never turned OFF.
     """
+    local = [OccupancyWindow(w.start.astimezone(tz), w.end.astimezone(tz),
+                             list(w.source_event_ids)) for w in windows]
     by_date: dict = {}
-    for w in ScheduleWriter.split_at_midnight(windows):
-        start = w.start.astimezone(tz)
-        end = w.end.astimezone(tz)
+    for w in ScheduleWriter.split_at_midnight(local):
+        start, end = w.start, w.end
         if end <= start:
             continue
         day = start.date()
@@ -153,8 +179,8 @@ class BacnetScheduleWriter(ScheduleWriter):
     """Writes BACnet Schedule Exception_Schedule over BACnet/IP."""
 
     name = "bacnet"
-    description = ("Standard BACnet/IP Schedule objects — works with Niagara, "
-                   "WebCTRL, EcoStruxure and any BTL-listed controller.")
+    description = ("Standard BACnet/IP Schedule objects — WebCTRL, "
+                   "EcoStruxure, Niagara, any BTL-listed controller.")
 
     def __init__(self, system_name: str, cfg: dict, tz, retry=None):
         super().__init__(system_name, cfg, tz, retry)

@@ -749,19 +749,31 @@ def test_safety_allows_the_first_ever_run():
     assert verdict and "no previous run" in verdict.reason
 
 
-def test_safety_scopes_to_one_system_when_limited():
-    """A --system run must compare against that system only. Otherwise every
-    OTHER system's schedules look 'cleared' and the rail blocks a perfectly
-    normal single-building commissioning run."""
+def test_safety_only_counts_schedules_this_run_manages():
+    """The comparison is scoped to what the run actually writes.
+
+    Two ways that matters: a --system run only manages one BAS, and a room
+    removed from the map is no longer written at all. Counting either as
+    "cleared" would block a perfectly normal sync with a false alarm about
+    buildings nobody is touching."""
     from bassync import safety
     previous = {"windows": {"supervisor:A/Rm1": 3, "campus_bacnet:12001:5": 2,
                             "campus_bacnet:12001:6": 4}}
-    schedule = {Destination("supervisor", "A/Rm1"): [OccupancyWindow(dt(9), dt(10))]}
-    assert safety.check(base_config(), schedule, set(schedule), event_count=5,
-                        previous=previous, only_system="supervisor")
-    # Unscoped, the same run reads as a campus-wide clear.
-    assert not safety.check(base_config(), schedule, set(schedule),
-                            event_count=5, previous=previous)
+    # A --system supervisor run: all_destinations holds only its schedules.
+    only = Destination("supervisor", "A/Rm1")
+    assert safety.check(base_config(), {only: [OccupancyWindow(dt(9), dt(10))]},
+                        {only}, event_count=5, previous=previous)
+
+
+def test_safety_ignores_rooms_removed_from_the_map():
+    """Decommissioning rooms must not look like a mass clear."""
+    from bassync import safety
+    previous = {"windows": {f"sys:A/Rm{i}": 3 for i in range(1, 7)}}
+    kept = {dest("A/Rm1"), dest("A/Rm2")}
+    schedule = {d: [OccupancyWindow(dt(9), dt(10))] for d in kept}
+    verdict = safety.check(base_config(), schedule, kept, event_count=8,
+                           previous=previous)
+    assert verdict, verdict.reason
 
 
 def test_safety_state_merges_on_a_scoped_run():
@@ -1517,7 +1529,7 @@ spaces: []
 """
     sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
     assert any("unknown building 'nosuch'" in e for e in sm.errors), sm.errors
-    assert any("non-numeric level" in e for e in sm.errors), sm.errors
+    assert any("`level` must be a whole number" in e for e in sm.errors), sm.errors
     assert any("defined twice" in e for e in sm.errors), sm.errors
 
 
@@ -1651,6 +1663,185 @@ def test_editor_migrates_legacy_key_in_all_three_sections():
     for row in (buildings[0], floors[0], rooms[0]):
         assert "niagara_path" not in row, row
         assert row["target"].startswith("B/"), row
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rooms with no schedule of their own (floor- or building-level scheduling)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_room_without_target_still_drives_its_rollups():
+    """How finely a building can be scheduled depends on how it was built out.
+    A room in a building that is only schedulable at the air handler has no
+    `target:` of its own — but its bookings must still turn the building on."""
+    text = """
+buildings:
+  - id: b
+    target: "B/AHU_Occ"
+floors:
+  - building: b
+    level: 2
+    target: "B/F2_Corridor"
+spaces:
+  - space_id: 1
+    space_name: "Old wing 201"
+    building: b
+    floor: 2
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert not sm.errors, sm.errors
+    room = sm.spaces["1"]
+    assert room.destination is None, "no schedule of its own"
+    assert room.floor_destination == dest("B/F2_Corridor")
+    assert room.building_destination == dest("B/AHU_Occ")
+    # It writes no room schedule, but both roll-ups are managed and driven.
+    assert sm.destinations() == {dest("B/F2_Corridor"), dest("B/AHU_Occ")}
+
+    schedule = ScheduleBuilder(5).build([event(1, dt(9), dt(11), "E")], sm)
+    for d in sm.destinations():
+        schedule.setdefault(d, [])
+    assert len(schedule[dest("B/F2_Corridor")]) == 1
+    assert len(schedule[dest("B/AHU_Occ")]) == 1
+
+
+def test_room_driving_nothing_is_an_error():
+    """A room with neither a target nor a roll-up would swallow its bookings
+    silently. That is always a mapping mistake, so say so."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    space_name: "Orphan"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert any("drive nothing" in e for e in sm.errors), sm.errors
+
+
+def test_mixed_granularity_campus():
+    """The three patterns a campus actually has, in one map: per-room where the
+    controls support it, per-floor for a partial retrofit, per-building for the
+    oldest air handlers."""
+    text = """
+buildings:
+  - id: new_hall
+    system: webctrl
+    target: "12100:100"
+  - id: mid_hall
+    target: "12200:100"
+  - id: old_hall
+    target: "12300:100"
+floors:
+  - building: mid_hall
+    level: 1
+    target: "12200:110"
+spaces:
+  - space_id: 1
+    building: new_hall
+    target: "12100:5"
+  - space_id: 2
+    building: mid_hall
+    floor: 1
+  - space_id: 3
+    building: old_hall
+"""
+    cfg = base_config()
+    cfg["systems"] = {"webctrl": {"driver": "bacnet", "local_address": "10.0.0.1/24"},
+                      "sys": {"driver": "preview"}}
+    sm = with_yaml(text, lambda p: load_space_map(p, cfg))
+    assert not sm.errors, sm.errors
+    assert sm.spaces["1"].destination == Destination("webctrl", "12100:5")
+    assert sm.spaces["2"].destination is None
+    assert sm.spaces["3"].destination is None
+
+    schedule = ScheduleBuilder(5).build(
+        [event(1, dt(9), dt(10), "A"), event(2, dt(9), dt(10), "B"),
+         event(3, dt(9), dt(10), "C")], sm)
+    for d in sm.destinations():
+        schedule.setdefault(d, [])
+    # Room-level where available, floor-level for the partial retrofit,
+    # building-level for the oldest wing.
+    assert len(schedule[Destination("webctrl", "12100:5")]) == 1
+    assert len(schedule[dest("12200:110")]) == 1
+    assert len(schedule[dest("12300:100")]) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# regressions found in the 1.1 audit
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_bacnet_splits_at_the_devices_midnight_not_the_campus():
+    """A building in another timezone must be split at ITS local midnight.
+
+    Splitting in campus time first produced a window that turned ON at 23:30
+    and never turned OFF — the controller would have run until the next
+    exception, which is to say all night and most of the next day."""
+    from bassync.drivers.bacnet import windows_to_daily
+    campus, device = ZoneInfo("America/New_York"), ZoneInfo("America/Chicago")
+    # 00:30-02:00 Eastern is 23:30-01:00 Central: two dates on the device.
+    w = OccupancyWindow(datetime(2026, 6, 11, 0, 30, tzinfo=campus),
+                        datetime(2026, 6, 11, 2, 0, tzinfo=campus))
+    by_date = windows_to_daily([w], device)
+    assert len(by_date) == 2, by_date
+    first = by_date[datetime(2026, 6, 10).date()]
+    second = by_date[datetime(2026, 6, 11).date()]
+    assert [(t.strftime("%H:%M"), v) for t, v in first] == [("23:30", True)], first
+    assert [(t.strftime("%H:%M"), v) for t, v in second] == [
+        ("00:00", True), ("01:00", False)], second
+
+
+def test_bacnet_rejects_out_of_range_instances():
+    """Instances are 22-bit, and 4194303 is the reserved 'unconfigured' value a
+    controller reports before commissioning — never a real address."""
+    from bassync.drivers.base import DriverError
+    from bassync.drivers.bacnet import parse_target
+    for bad in ("4194303:5", "12001:4194303", "4194304:5", "12001:9999999"):
+        try:
+            parse_target(bad)
+        except DriverError:
+            continue
+        raise AssertionError(f"{bad!r} should be rejected")
+    assert parse_target("4194302:5").device_id == 4194302   # the real maximum
+
+
+def test_malformed_rows_are_reported_not_raised():
+    """One bad room must not take the other four hundred down with it."""
+    cases = {
+        "non-numeric minutes": ('spaces:\n  - space_id: 1\n    target: "B/R"\n'
+                                '    pre_condition_minutes: "forty-five"\n'),
+        "non-numeric gap": ('spaces:\n  - space_id: 2\n    target: "B/R"\n'
+                            '    merge_gap_minutes: wide\n'),
+        "room is not a mapping": 'spaces:\n  - "just a string"\n',
+        "building is not a mapping": 'buildings:\n  - "oops"\nspaces: []\n',
+    }
+    for name, text in cases.items():
+        sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+        assert sm.errors, f"{name}: expected a reported error"
+        assert not sm.spaces, f"{name}: the bad row must not be registered"
+
+
+def test_good_rows_survive_a_bad_neighbour():
+    """The rest of the map still loads around a broken row."""
+    text = """
+buildings: []
+spaces:
+  - space_id: 1
+    target: "B/Rm1"
+  - space_id: 2
+    target: "B/Rm2"
+    pre_condition_minutes: "oops"
+  - space_id: 3
+    target: "B/Rm3"
+"""
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert set(sm.spaces) == {"1", "3"}, sm.spaces
+    assert any("Room 2" in e for e in sm.errors), sm.errors
+
+
+def test_integral_float_space_id_normalises():
+    """YAML reads `1234.0` as a float; str() gives '1234.0', which would never
+    match the '1234' 25Live sends and the room would silently never sync."""
+    text = 'buildings: []\nspaces:\n  - space_id: 1234.0\n    target: "B/R"\n'
+    sm = with_yaml(text, lambda p: load_space_map(p, base_config()))
+    assert list(sm.spaces) == ["1234"], sm.spaces
 
 
 def main() -> int:

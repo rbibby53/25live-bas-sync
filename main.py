@@ -18,9 +18,9 @@ stand down when they're empty.
 
 The BAS side is pluggable. One run can drive a mixed campus:
 
-    bacnet    standard BACnet/IP Schedule objects — Tridium Niagara,
-              Automated Logic WebCTRL, Schneider EcoStruxure Building
-              Operation, and any other BTL-listed controller
+    bacnet    standard BACnet/IP Schedule objects — Automated Logic WebCTRL,
+              Schneider EcoStruxure Building Operation, Tridium Niagara, and
+              any other BTL-listed controller
     niagara   Niagara N4 BooleanSchedule SpecialEvents over REST
     rest      a vendor REST API you describe in config.yaml
     preview   writes nothing; logs and optionally exports CSV
@@ -43,21 +43,24 @@ import os
 import sys
 from pathlib import Path
 
-# Oldest Python this is tested against. 3.9 and 3.10 are both past end of life
-# and no longer get security fixes, which matters for something holding service
-# credentials on a building-controls network.
+# Oldest Python this is tested against. Anything older is either past end of
+# life or close to it, which matters for a process holding service credentials
+# on a building-controls network. 3.14 is what we recommend running.
 #
 # Checked here, before importing anything else, because the failure otherwise
 # surfaces as a confusing traceback from deep inside a dependency — and this
 # tends to be run by whoever is on shift, with whatever `python` is on PATH.
-MIN_PYTHON = (3, 11)
+MIN_PYTHON = (3, 13)
+RECOMMENDED_PYTHON = (3, 14)
 if sys.version_info < MIN_PYTHON:
     sys.exit(
         f"25live-bas-sync needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer, "
         f"but this is Python {sys.version.split()[0]} ({sys.executable}).\n"
-        "Install a supported Python and make sure the scheduled task, cron "
-        "entry, and Edit-Rooms.bat all invoke THAT interpreter — a common cause "
-        "is dependencies installed for one Python and the job running another.")
+        f"Install Python {RECOMMENDED_PYTHON[0]}.{RECOMMENDED_PYTHON[1]} (or "
+        f"at least {MIN_PYTHON[0]}.{MIN_PYTHON[1]}) and make sure the scheduled "
+        "task, cron entry, and Edit-Rooms.bat all invoke THAT interpreter — a "
+        "common cause is dependencies installed for one Python and the job "
+        "running another.")
 
 from bassync import __version__          # noqa: E402 — must follow the check
 from bassync.config import (ConfigError, default_log_file, load_config,

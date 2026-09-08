@@ -90,17 +90,16 @@ def save_state(path: str, schedule: dict, event_count: int,
 
 
 def check(cfg: dict, schedule: dict, all_destinations: set,
-          event_count: int, previous: Optional[dict] = None,
-          only_system: Optional[str] = None) -> SafetyVerdict:
+          event_count: int, previous: Optional[dict] = None) -> SafetyVerdict:
     """
     Decide whether this run is safe to write.
 
     `schedule` is what was built (destinations with bookings); anything in
     `all_destinations` and not in `schedule` gets cleared.
 
-    `only_system` scopes the comparison to one BAS. Without it, a `--system`
-    run would see every OTHER system's schedules missing from its own output
-    and read that as a mass clear.
+    The comparison is scoped to `all_destinations`, which handles both a
+    `--system` run (where it holds only that system's schedules) and rooms
+    removed from the map since the last run.
     """
     safety = cfg.get("safety") or {}
     if not safety.get("enabled", True):
@@ -119,10 +118,13 @@ def check(cfg: dict, schedule: dict, all_destinations: set,
     if previous is None:
         previous = load_state(safety.get("state_file") or "")
     prior_windows = previous.get("windows") or {}
-    if only_system:
-        prefix = f"{only_system}:"
-        prior_windows = {k: v for k, v in prior_windows.items()
-                         if k.startswith(prefix)}
+    # Only schedules this run still manages can be "cleared" by it. A room
+    # taken out of the map — decommissioned, handed to a contractor, moved to
+    # another system — is no longer written at all, so counting it as cleared
+    # would block the next sync with a false alarm about buildings nobody is
+    # touching.
+    managed = {str(d) for d in all_destinations}
+    prior_windows = {k: v for k, v in prior_windows.items() if k in managed}
     previously_occupied = {k for k, v in prior_windows.items() if v}
     if not previously_occupied:
         return SafetyVerdict(True, "no previous run to compare against")

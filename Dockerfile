@@ -15,9 +15,8 @@
 # network. Run it with host networking and point `local_address` at the HOST's
 # address. The niagara and rest drivers are ordinary HTTP and need none of this.
 
-# 3.12 rather than the 3.11 floor: newer is fine, and the base image is
-# maintained for longer.
-FROM python:3.12-slim
+# Matches the recommended runtime rather than the 3.13 floor.
+FROM python:3.14-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
