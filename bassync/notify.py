@@ -95,7 +95,7 @@ def _resolve_security(email_cfg: dict, port: int) -> str:
     """
     Which transport security to use: "starttls", "ssl", or "none".
 
-    `security:` is the current key. `use_tls:` is the pre-2.0 boolean and is
+    `security:` is the current key. `use_tls:` is the pre-1.0 boolean and is
     still honored. With neither, port 465 implies implicit TLS and everything
     else implies STARTTLS — the safe default, since a plaintext fallback would
     silently put a relay password on the wire.

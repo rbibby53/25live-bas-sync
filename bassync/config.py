@@ -142,7 +142,7 @@ DEFAULTS_FILE_MAP = {
 }
 
 
-# Keys of the pre-2.0 top-level `niagara:` block. When a config has that and no
+# Keys of the pre-1.0 top-level `niagara:` block. When a config has that and no
 # `systems:`, it is folded into a system named "niagara" so existing
 # deployments upgrade without touching their YAML.
 LEGACY_NIAGARA_KEYS = {
@@ -153,9 +153,9 @@ LEGACY_NIAGARA_KEYS = {
 
 def migrate_legacy_systems(cfg: dict) -> None:
     """
-    Fold a pre-2.0 top-level `niagara:` block into `systems:` in place.
+    Fold a pre-1.0 top-level `niagara:` block into `systems:` in place.
 
-    Before 2.0 there was exactly one BAS and its settings lived under
+    Before 1.0 there was exactly one BAS and its settings lived under
     `niagara:`. Rather than force every existing site to rewrite config.yaml,
     that block is promoted to `systems: {niagara: {driver: niagara, ...}}` and
     becomes the default system. An explicit `systems:` block always wins; the

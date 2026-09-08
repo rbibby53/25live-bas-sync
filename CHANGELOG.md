@@ -2,13 +2,16 @@
 
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
-semantic versioning once it reaches a tagged release.
+semantic versioning from 1.0 onward.
 
-## [2.0.0] — Unreleased
+## [1.0] — 2026-09-08
 
-Multi-vendor release. The sync is no longer Niagara-specific: it drives any
-BTL-listed BAS over standard BACnet, and one nightly run can cover a mixed
-campus. **Existing 1.x deployments keep working** — see *Upgrading* below.
+**First stable release.** The sync is no longer Niagara-specific: it drives any
+BTL-listed BAS over standard BACnet, so one nightly run can cover a mixed campus
+of Tridium Niagara, Automated Logic WebCTRL and Schneider EcoStruxure.
+
+Everything below is relative to **V1.0 RC1**. Existing RC/beta deployments keep
+working untouched — see *Upgrading* at the end.
 
 ### Added
 - **Pluggable BAS drivers.** `python main.py --list-drivers`:
@@ -88,16 +91,26 @@ campus. **Existing 1.x deployments keep working** — see *Upgrading* below.
   `config.yaml` now warns.
 - Repository renamed to **25live-bas-sync**.
 
-### Upgrading from 1.x
+### Upgrading from V1.0 RC1 or a beta
+No configuration changes are required:
 - A top-level `niagara:` block is promoted to `systems:` automatically and made
-  the default — no edit required.
-- `BAS_NIAGARA_PASSWORD` and `niagara_path:` are both still honored.
-- Expect some buildings to stand down after the upgrade: that is the roll-up
-  clear-loop fix working. Run `--validate` and `--dry-run` first.
+  the default.
+- `BAS_NIAGARA_PASSWORD` and `niagara_path:` are both still honored; the editor
+  renames `niagara_path:` to `target:` the next time it saves.
+
+Two behaviour changes to expect on the first run:
+1. **Building roll-ups with no bookings are now cleared.** Some buildings will
+   genuinely stand down after the upgrade — that is the fix working, not a
+   regression.
+2. **The mass-clear safety rail is on by default.** A first run during a break
+   may stop and exit 7. Read the log, then re-run with `--force` if the drop is
+   real.
+
+Run `--validate` and `--dry-run` first, as always.
 
 [BACpypes3]: https://github.com/JoelBender/BACpypes3
 
-## [1.x]
+## [V1.0 RC1] and earlier pre-releases
 
 ### Added
 - **`defaults.yaml`** — global scheduling defaults (run-up, run-down, merge-gap,

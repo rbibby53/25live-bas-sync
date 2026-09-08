@@ -72,7 +72,7 @@ ROOM_KEY_ORDER = ["space_id", "space_name", "building", "system", "target",
                   "pre_condition_minutes", "post_buffer_minutes",
                   "merge_gap_minutes", "note"]
 
-# Pre-2.0 key name. Read and migrated to `target` on load, so an existing map
+# Pre-1.0 key name. Read and migrated to `target` on load, so an existing map
 # opens, edits and saves without anyone having to do a find-and-replace.
 LEGACY_TARGET_KEY = "niagara_path"
 
@@ -114,7 +114,7 @@ def load_mapping(path) -> tuple[list[dict], list[dict]]:
 
 
 def _migrate_row(row: dict) -> dict:
-    """Rename a pre-2.0 `niagara_path:` to `target:`, preserving field order.
+    """Rename a pre-1.0 `niagara_path:` to `target:`, preserving field order.
 
     Done on load rather than on save so the editor only ever deals in one key
     name, and an old map upgrades the first time someone saves it."""
@@ -187,7 +187,7 @@ def configured_systems(config_path=None) -> list:
     except (OSError, yaml.YAMLError):
         return []
     names = list((data.get("systems") or {}).keys())
-    # A pre-2.0 config has a bare `niagara:` block instead of `systems:`.
+    # A pre-1.0 config has a bare `niagara:` block instead of `systems:`.
     if not names and isinstance(data.get("niagara"), dict):
         names = ["niagara"]
     return sorted(str(n) for n in names)

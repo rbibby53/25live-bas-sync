@@ -221,7 +221,7 @@ spaces:
 
 
 def test_loader_accepts_legacy_niagara_path():
-    """A pre-2.0 map using `niagara_path:` still loads unchanged, so an
+    """A pre-1.0 map using `niagara_path:` still loads unchanged, so an
     existing campus upgrades without a mass edit."""
     text = """
 buildings:
@@ -443,7 +443,7 @@ def test_load_config_reads_defaults_file():
 
 
 def test_legacy_niagara_block_becomes_a_system():
-    """A pre-2.0 config with a bare `niagara:` block keeps working: it is
+    """A pre-1.0 config with a bare `niagara:` block keeps working: it is
     promoted to a system and becomes the default."""
     cfg = {"niagara": {"host": "n4.example.edu", "port": 8443,
                        "schedule_base_path": "slot:/Schedules"}}
@@ -976,7 +976,7 @@ def test_editor_roundtrip_feeds_loader():
 
 
 def test_editor_migrates_legacy_key_on_load():
-    """Opening a pre-2.0 map renames niagara_path -> target in place, so saving
+    """Opening a pre-1.0 map renames niagara_path -> target in place, so saving
     it upgrades the file without anyone doing a find-and-replace."""
     import editor
     text = ("buildings:\n  - id: b\n    niagara_path: 'B/Occ'\n"
@@ -1001,7 +1001,7 @@ def test_editor_flags_unknown_building():
 
 
 def test_editor_reads_systems_from_config():
-    """The System dropdown is populated from config.yaml, and a pre-2.0 config
+    """The System dropdown is populated from config.yaml, and a pre-1.0 config
     still offers its single Niagara system."""
     import editor
     text = "systems:\n  campus_bacnet:\n    driver: bacnet\n  supervisor:\n    driver: niagara\n"
@@ -1052,7 +1052,7 @@ def test_send_alert_webhook_and_disabled():
 
 
 def test_smtp_security_resolution():
-    """`security:` wins; the pre-2.0 `use_tls:` boolean still works; and with
+    """`security:` wins; the pre-1.0 `use_tls:` boolean still works; and with
     neither, port 465 means implicit TLS and everything else STARTTLS. The
     default must never be plaintext — that would put a relay password on the
     wire without anyone asking for it."""

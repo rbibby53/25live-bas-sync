@@ -59,7 +59,7 @@ def _target_of(row: dict, what: str, where: str,
     """
     The schedule address for a row.
 
-    `target:` is the current key. `niagara_path:` is the pre-2.0 name and is
+    `target:` is the current key. `niagara_path:` is the pre-1.0 name and is
     still accepted verbatim, so an existing campus map keeps working after the
     upgrade without a mass edit.
     """

@@ -24,7 +24,7 @@ It's a single-run script meant to be scheduled nightly. It is read-only against
 - [Safety rails](#safety-rails)
 - [BAS setup, by vendor](#bas-setup-by-vendor)
 - [25Live setup](#25live-setup)
-- [Upgrading from 1.x](#upgrading-from-1x)
+- [Upgrading from a pre-1.0 release](#upgrading-from-a-pre-10-release)
 - [Tests](#tests)
 
 ## Why BACnet
@@ -372,20 +372,21 @@ your API is assumed; `config.example.yaml` has a commented starting template and
 - Find a space's numeric `space_id` from its detail-page URL in 25Live, or run
   `--discover`.
 
-## Upgrading from 1.x
+## Upgrading from a pre-1.0 release
 
-Existing deployments keep working — the upgrade is additive:
+Existing beta/RC deployments keep working — the upgrade is additive:
 
-- A pre-2.0 `config.yaml` with a top-level **`niagara:`** block is automatically
+- A pre-1.0 `config.yaml` with a top-level **`niagara:`** block is automatically
   promoted to `systems: {niagara: {driver: niagara, ...}}` and made the default.
   Nothing to edit.
 - `BAS_NIAGARA_PASSWORD` is still honored alongside the new
   `BAS_SYS_<NAME>_PASSWORD` form.
 - **`niagara_path:`** in `space_mapping.yaml` is still read. The editor renames
   it to `target:` the next time you save.
-- New: `python main.py --list-drivers`, `--system`, `--force`; exit code `7`.
+- New: `python main.py --list-drivers`, `--system`, `--force`, `--test-alert`;
+  exit code `7`.
 
-Two behaviour changes worth knowing before your first 2.0 run:
+Two behaviour changes worth knowing before your first 1.0 run:
 
 1. **Building roll-ups with no bookings are now cleared.** Previously only room
    schedules were, so a building whose rooms all went quiet kept conditioning on

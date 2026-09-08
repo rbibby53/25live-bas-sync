@@ -64,7 +64,7 @@
 #             "slot:/Other/Sched"    an absolute ORD is used as-is
 #   rest      whatever your configured path template expects
 #
-# Pre-2.0 maps used `niagara_path:` instead of `target:`. That still works —
+# Pre-1.0 maps used `niagara_path:` instead of `target:`. That still works —
 # nothing needs rewriting — and the editor renames it when you next save.
 # ─────────────────────────────────────────────────────────────────────────────
 

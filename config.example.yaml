@@ -207,7 +207,7 @@ alerts:
     #   ssl       TLS from the first byte, i.e. SMTPS (port 465)
     #   none      plaintext; only for an internal relay on a trusted network
     # Omit it and port 465 implies ssl, anything else implies starttls. The
-    # pre-2.0 `use_tls: true/false` boolean is still honored.
+    # pre-1.0 `use_tls: true/false` boolean is still honored.
     security: "starttls"
 
     # Leave username blank for an open internal relay that doesn't authenticate.
